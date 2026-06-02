@@ -1,23 +1,69 @@
 # 光年币领取系统
 
-这是一个基于 Node.js 的飞书多维表格领取申请服务。用户在网页填写人员、数量和任务后，服务会通过企业自建应用调用 Feishu OpenAPI，把申请写入多维表格，并支持管理员确认或驳回。
+这是一个可部署的 Node.js 单服务应用。用户通过飞书 OAuth 登录后，系统会校验其是否在前端白名单表中；白名单用户可以手动提交或通过图片批量上传光年币领取记录，后端会直接写入多维表格并自动确认入账。
+
+## 当前能力
+
+- 飞书 OAuth 登录。
+- 前端白名单校验。
+- 白名单用户自动确认入账。
+- 支持单人/多人手动领取。
+- 支持图片 OCR 批量识别，最多一次提交 20 条。
+- 入账后通知管理员、提交人和被入账人。
+- 支持 systemd + Nginx 轻量部署。
 
 ## 运行要求
 
 - Node.js 18+
 - 飞书企业自建应用
-- 应用需要具备多维表格读写、搜索用户、读取通讯录用户、发送消息等权限
-- 应用需要被安装到企业，并对目标多维表格有访问权限
+- 飞书应用需要具备以下能力：
+  - 获取用户身份或网页 OAuth 登录
+  - 多维表格读写
+  - 读取通讯录用户
+  - 搜索用户
+  - 发送消息
+- 飞书应用需要被安装到企业，并且对目标多维表格有访问权限。
+
+## 多维表格要求
+
+系统默认使用三张表：
+
+- 流水表：记录每次光年币领取。
+- 账户表：维护人员账户和人员字段。
+- 前端白名单表：维护允许访问领取页面的飞书人员。
+
+前端白名单表至少需要一个“人员”字段，并把字段 ID 配置到 `WHITELIST_PERSON_FIELD`。
 
 ## 环境变量
 
+先复制示例文件：
+
 ```bash
-export FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
-export FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
-export PORT=4173
+cp .env.example .env
 ```
 
-`FEISHU_APP_ID` 默认值为代码中的历史 App ID；生产环境建议显式设置。`FEISHU_APP_SECRET` 必填。
+`.env` 示例：
+
+```bash
+FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
+BASE_TOKEN=xxxxxxxxxxxxxxxx
+LEDGER_TABLE=tblxxxxxxxxxxxx
+ACCOUNT_TABLE=tblxxxxxxxxxxxx
+WHITELIST_TABLE=tblxxxxxxxxxxxx
+WHITELIST_PERSON_FIELD=fldxxxxxxxx
+ADMIN_USER_ID=ou_xxxxxxxxxxxxxxxx
+PUBLIC_ORIGIN=https://guangnianbi.yc345.tv
+SESSION_SECRET=请填写32位以上随机字符串
+PORT=19001
+```
+
+说明：
+
+- `PUBLIC_ORIGIN` 必须是用户实际访问的 HTTPS 地址。
+- 飞书开发者后台的 OAuth 重定向 URL 必须配置为：`PUBLIC_ORIGIN/oauth/callback`。
+- `SESSION_SECRET` 用于签名 Cookie，不能使用示例值。
+- `WHITELIST_TABLE` 为空或字段 ID 错误时，所有业务接口都会无法通过白名单校验。
 
 ## 本地启动
 
@@ -32,24 +78,21 @@ npm start
 http://localhost:4173
 ```
 
-## 部署说明
+如果本地调试 OAuth，需要把本地回调地址也加入飞书开发者后台：
 
-生产环境建议使用 Nginx 或其他网关提供对外访问，并反向代理到 `PORT` 指定的 Node 后端端口。当前模板对外监听 `19001` 的 HTTPS，Node 后端默认监听 `4173`。
-
-### systemd 部署
-
-先创建 `.env`：
-
-```bash
-cp .env.example .env
-vim .env
+```text
+http://localhost:4173/oauth/callback
 ```
 
-把 `FEISHU_APP_SECRET` 改成飞书开放平台里企业自建应用的 `App Secret`。
+## systemd 部署
 
-`.env` 中建议设置 `PORT=19001`，由 Node 直接对外提供页面和 API。
+当前模板默认服务目录为：
 
-安装并启动 systemd 服务（系统级，需要 sudo）：
+```text
+/data/program/background_coin-main
+```
+
+安装并启动系统级服务：
 
 ```bash
 sudo cp deploy/guangnian-claim.service /etc/systemd/system/guangnian-claim.service
@@ -58,7 +101,7 @@ sudo systemctl enable --now guangnian-claim
 sudo systemctl status guangnian-claim
 ```
 
-无 sudo 时，可使用用户级 systemd（当前机器已按此方式部署）：
+无 sudo 时可以使用用户级 systemd：
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -74,16 +117,9 @@ loginctl enable-linger $USER
 journalctl --user -u guangnian-claim -f
 ```
 
-### Nginx 前端与反向代理
+## Nginx 反向代理
 
-项目提供了两个 Nginx 配置模板：
-
-- `deploy/nginx-guangnian-claim.conf`：HTTP，监听 `80`，转发到 Node 的 `19001`
-- `deploy/nginx-guangnian-claim.https.conf`：HTTPS，监听 `443`，转发到 Node 的 `19001`
-
-当前 Node 服务由 systemd 监听 `19001`，Nginx 只负责域名和 HTTPS。
-
-HTTP 配置安装：
+HTTP 模板：
 
 ```bash
 sudo cp deploy/nginx-guangnian-claim.conf /etc/nginx/sites-available/guangnian-claim.conf
@@ -92,40 +128,7 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-访问地址：
-
-```text
-http://guangnianbi.yc345.tv
-```
-
-### HTTPS 配置
-
-当前域名 `guangnianbi.yc345.tv` 解析到内网 IP `10.8.8.68`，公网 CA 通常无法通过 HTTP challenge 访问该地址。推荐使用 DNS challenge：
-
-```bash
-sudo certbot certonly --manual --preferred-challenges dns -d guangnianbi.yc345.tv
-```
-
-Certbot 会提示添加一条 TXT 记录，主机记录一般是：
-
-```text
-_acme-challenge.guangnianbi
-```
-
-TXT 生效后再按 Enter。可以用以下命令确认：
-
-```bash
-dig +short _acme-challenge.guangnianbi.yc345.tv TXT
-```
-
-证书生成后，HTTPS 模板使用以下证书路径：
-
-```text
-/etc/letsencrypt/live/guangnianbi.yc345.tv/fullchain.pem
-/etc/letsencrypt/live/guangnianbi.yc345.tv/privkey.pem
-```
-
-安装 HTTPS 配置：
+HTTPS 模板：
 
 ```bash
 sudo cp deploy/nginx-guangnian-claim.https.conf /etc/nginx/sites-available/guangnian-claim.conf
@@ -134,19 +137,25 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-HTTPS 访问地址：
+HTTPS 证书路径需要与 `deploy/nginx-guangnian-claim.https.conf` 中的配置一致。
 
-```text
-https://guangnianbi.yc345.tv
+## 安全说明
+
+- 只有飞书登录且在白名单表中的用户可以访问业务接口。
+- 会话 Cookie 使用 `SESSION_SECRET` 签名，后端会校验是否被篡改。
+- 生产环境建议只通过 `PUBLIC_ORIGIN` 访问，避免跨域 Cookie 滥用。
+- 图片 OCR 接口限制请求体大小和图片大小，避免超大图片占用过多内存。
+- 白名单用户提交后会自动写入 `已确认` 和 `是`，不再等待管理员审批。
+- `package.json` 使用 `overrides` 固定 `axios` 到修复版本，避免飞书 SDK 间接依赖旧版本造成安全审计失败。
+
+## 验证命令
+
+```bash
+npm test
+npm start
+curl -i http://127.0.0.1:4173/
+curl -i http://127.0.0.1:4173/api/me
+npm audit --audit-level=high
 ```
 
-普通网页审批入口为：
-
-```text
-https://guangnianbi.yc345.tv/review?action=confirm&serial=流水号
-https://guangnianbi.yc345.tv/review?action=reject&serial=流水号
-```
-
-## 备注
-
-当前版本直接通过 `@larksuiteoapi/node-sdk` 访问 Feishu OpenAPI，不再依赖 `lark-cli` 或本机登录态，适合服务器长期运行。
+上线前应确认 `npm audit --audit-level=high` 输出 `found 0 vulnerabilities`。如果后续升级飞书 SDK，需要重新检查 `package.json` 中的依赖覆盖规则是否仍然生效。
