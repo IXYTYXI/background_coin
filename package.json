@@ -5,9 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "node server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.64.0"
+    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "tesseract.js": "^7.0.0"
+  },
+  "overrides": {
+    "axios": "^1.16.1"
   }
 }

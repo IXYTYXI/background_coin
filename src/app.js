@@ -3,7 +3,9 @@ const state = {
   selections: {},
   lastSubmission: null,
   pendingSubmission: null,
-  currentPage: 'form'
+  currentPage: 'gate',
+  batchRows: [],
+  me: null
 };
 
 const FALLBACK_TASKS = [
@@ -44,13 +46,23 @@ const FALLBACK_TASKS = [
   '任务13｜半年度复盘'
 ];
 
+const gatePage = document.querySelector('#gatePage');
+const gateTitle = document.querySelector('#gateTitle');
+const gateCopy = document.querySelector('#gateCopy');
+const gateMessage = document.querySelector('#gateMessage');
+const loginLink = document.querySelector('#loginLink');
 const formPage = document.querySelector('#formPage');
 const statusPage = document.querySelector('#statusPage');
+const manualClaimPanel = document.querySelector('#manualClaimPanel');
 const peopleInput = document.querySelector('#peopleInput');
 const form = document.querySelector('#claimForm');
 const amountInput = document.querySelector('#amountInput');
 const taskSelect = document.querySelector('#taskSelect');
 const formMessage = document.querySelector('#formMessage');
+const imageInput = document.querySelector('#imageInput');
+const pasteZone = document.querySelector('#pasteZone');
+const batchMessage = document.querySelector('#batchMessage');
+const batchEditor = document.querySelector('#batchEditor');
 const selectionPanel = document.querySelector('#selectionPanel');
 const backBtn = document.querySelector('#backBtn');
 const statusHeading = document.querySelector('#statusHeading');
@@ -69,10 +81,14 @@ const toastCloseBtn = document.querySelector('#toastCloseBtn');
 const API_BASE = window.location.protocol === 'file:'
   ? 'http://localhost:4173'
   : '';
+const query = new URLSearchParams(window.location.search);
 
 async function request(path, options) {
+  // 生产部署走同源 API，由 Nginx 把请求反向代理给 Node 后端。
+  // credentials: 'include' 用于携带后端签名 Cookie，会话校验只在后端完成。
   const response = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     ...options
   });
   const payload = await response.json();
@@ -90,11 +106,179 @@ function setMessage(text, type = '') {
   formMessage.className = `message ${type}`.trim();
 }
 
+function setBatchMessage(text, type = '') {
+  batchMessage.textContent = text;
+  batchMessage.className = `message ${type}`.trim();
+}
+
 function showToast(title, body) {
   toastTitle.textContent = title;
   toastBody.textContent = body;
   toast.hidden = false;
   toastCloseBtn.focus();
+}
+
+function rowKey(index) {
+  return `row:${index + 1}`;
+}
+
+function ensureBatchKeys(rows = []) {
+  return rows.map((row, index) => ({
+    key: row.key || rowKey(index),
+    ...row
+  }));
+}
+
+function syncManualClaimVisibility() {
+  manualClaimPanel.hidden = state.batchRows.length > 0;
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('图片读取失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function taskOptionsHtml(selectedTask) {
+  return '<option value="">请选择任务</option>' + state.tasks
+    .map((task) => `<option value="${escapeHtml(task)}" ${task === selectedTask ? 'selected' : ''}>${escapeHtml(task)}</option>`)
+    .join('');
+}
+
+function renderBatchEditor() {
+  if (!state.batchRows.length) {
+    batchEditor.hidden = true;
+    batchEditor.innerHTML = '';
+    syncManualClaimVisibility();
+    return;
+  }
+
+  batchEditor.hidden = false;
+  syncManualClaimVisibility();
+  batchEditor.innerHTML = `
+    <div class="batch-toolbar">
+      <p>识别到 ${state.batchRows.length} 条，请确认后提交。</p>
+      <button id="clearBatchBtn" class="text-button" type="button">清空</button>
+    </div>
+    <div class="batch-table-wrap">
+      <table class="batch-table">
+        <thead>
+          <tr>
+            <th>人员</th>
+            <th>任务</th>
+            <th>数量</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${state.batchRows.map((row, index) => `
+            <tr data-index="${index}">
+              <td><input class="batch-name" value="${escapeHtml(row.name)}" aria-label="人员姓名" /></td>
+              <td>
+                <select class="batch-task" aria-label="任务">
+                  ${taskOptionsHtml(row.task)}
+                </select>
+                ${row.rawTask && !row.task ? `<small class="batch-warning">未匹配：${escapeHtml(row.rawTask)}</small>` : ''}
+              </td>
+              <td><input class="batch-amount" type="number" min="1" step="1" value="${escapeHtml(row.amount)}" aria-label="领取数量" /></td>
+              <td><button class="row-remove" type="button" aria-label="删除此行">删除</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+    <button id="submitBatchBtn" class="primary" type="button">提交批量申请</button>
+  `;
+}
+
+function syncBatchRowsFromDom() {
+  state.batchRows = Array.from(batchEditor.querySelectorAll('tbody tr')).map((row) => {
+    const index = Number(row.dataset.index);
+    return {
+      key: state.batchRows[index]?.key || rowKey(index),
+      name: row.querySelector('.batch-name').value.trim(),
+      task: row.querySelector('.batch-task').value,
+      amount: Number(row.querySelector('.batch-amount').value),
+      rawTask: state.batchRows[index]?.rawTask || ''
+    };
+  });
+}
+
+async function recognizeImageFile(file) {
+  if (!file || !file.type.startsWith('image/')) {
+    showToast('图片格式不支持', '请上传或粘贴 png、jpg、jpeg、webp 图片。');
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    showToast('图片过大', '请上传 8MB 以内的图片。');
+    return;
+  }
+  setBatchMessage('正在识别图片，请稍候。');
+  try {
+    const image = await fileToDataUrl(file);
+    const payload = await request('/api/claim-image/recognize', {
+      method: 'POST',
+      body: JSON.stringify({ image })
+    });
+    state.batchRows = ensureBatchKeys((payload.records || []).slice(0, 20));
+    renderBatchEditor();
+    setBatchMessage(
+      state.batchRows.length
+        ? `已识别 ${state.batchRows.length} 条，请确认人员、任务和数量。`
+        : '没有识别到有效记录，请换一张更清晰的表格截图。',
+      state.batchRows.length ? 'ok' : 'error'
+    );
+  } catch (error) {
+    setBatchMessage(error.message || '图片识别失败，请稍后重试。', 'error');
+  } finally {
+    imageInput.value = '';
+  }
+}
+
+async function submitBatchRows() {
+  syncBatchRowsFromDom();
+  const invalidIndex = state.batchRows.findIndex((row) => !row.name || !row.task || !Number.isInteger(Number(row.amount)) || Number(row.amount) <= 0);
+  if (invalidIndex >= 0) {
+    setBatchMessage(`第 ${invalidIndex + 1} 行信息不完整，请补齐人员、任务和正整数数量。`, 'error');
+    return;
+  }
+  const submission = {
+    people: state.batchRows.map((row) => row.name).join('、'),
+    amount: state.batchRows.reduce((sum, row) => sum + Number(row.amount || 0), 0),
+    task: `${state.batchRows.length} 条批量申请`
+  };
+  state.pendingSubmission = submission;
+  setStatusPage('pending', { submission });
+  try {
+    const payload = await request('/api/claims', {
+      method: 'POST',
+      body: JSON.stringify({
+        items: state.batchRows.map((row) => ({
+          key: row.key,
+          name: row.name,
+          task: row.task,
+          amount: Number(row.amount)
+        })),
+        selectedUsers: state.selections
+      })
+    });
+    populateSuccess(payload, submission);
+    clearSelections();
+    state.batchRows = [];
+    renderBatchEditor();
+    setBatchMessage('');
+  } catch (error) {
+    showPage('form');
+    if (error.status === 409 && error.payload?.selectionRequired) {
+      renderSelectionPanel(error.payload.selectionRequired);
+      setBatchMessage('存在重名人员，请选择对应人员后再次提交批量申请。', 'error');
+    } else {
+      setBatchMessage(friendlySubmitError(error), 'error');
+    }
+  }
 }
 
 function hideToast() {
@@ -117,11 +301,13 @@ function friendlySubmitError(error) {
 function renderTasks() {
   if (!state.tasks.length) {
     taskSelect.innerHTML = '<option value="">正在加载任务...</option>';
+    renderBatchEditor();
     return;
   }
   taskSelect.innerHTML = state.tasks
     .map((task) => `<option value="${escapeHtml(task)}">${escapeHtml(task)}</option>`)
     .join('');
+  renderBatchEditor();
 }
 
 function escapeHtml(value) {
@@ -180,9 +366,9 @@ selectionPanel.addEventListener('click', (event) => {
 
 function showPage(page) {
   state.currentPage = page;
-  const isForm = page === 'form';
-  formPage.hidden = !isForm;
-  statusPage.hidden = isForm;
+  gatePage.hidden = page !== 'gate';
+  formPage.hidden = page !== 'form';
+  statusPage.hidden = page !== 'status';
 }
 
 function parsePeopleText(value) {
@@ -203,17 +389,17 @@ function setStatusPage(status, detail = {}) {
   statusCopy.textContent = isPending
     ? '正在把申请写入多维表格，请稍候。'
     : isSuccess
-      ? '申请已进入多维表格流程，等待管理员确认后处理。'
+      ? '申请已写入多维表格，光年币已自动入账。'
       : '申请没有提交成功，请返回检查后重试。';
 
-  statusBadge.textContent = isPending ? '提交中' : isSuccess ? '已提交' : '提交失败';
+  statusBadge.textContent = isPending ? '提交中' : isSuccess ? '已入账' : '提交失败';
   statusBadge.className = `success-badge ${isPending ? 'pending' : isError ? 'error' : ''}`.trim();
 
-  successTitle.textContent = isPending ? '正在提交申请' : isSuccess ? '你的领取申请已提交' : '申请提交失败';
+  successTitle.textContent = isPending ? '正在提交申请' : isSuccess ? '你的领取申请已入账' : '申请提交失败';
   successBody.textContent = isPending
     ? '请不要关闭页面。'
     : isSuccess
-      ? '你的申请已经进入审批流程，接下来请等待管理员确认。'
+      ? '本次领取已经自动确认，相关人员会收到余额更新提醒。'
       : detail.message || '请检查姓名是否正确，或联系管理员@芮婷。';
 
   successPeople.textContent = submission.people || '-';
@@ -238,6 +424,43 @@ function populateSuccess(payload, submission) {
 }
 
 async function load() {
+  // 页面首次加载只做身份与白名单校验。
+  // 只有 /api/me 返回 authorized=true 后，才展示领取表单和批量上传入口。
+  showPage('gate');
+  loginLink.hidden = true;
+  gateTitle.textContent = '正在校验权限';
+  gateCopy.textContent = '正在确认你的飞书身份和页面访问权限。';
+  gateMessage.textContent = query.get('login') === 'failed'
+    ? '飞书登录回调没有完成，请确认飞书开发者后台已配置当前回调地址。'
+    : '请稍候。';
+
+  try {
+    const me = await request('/api/me');
+    state.me = me;
+    if (!me.authenticated) {
+      gateTitle.textContent = '需要飞书登录';
+      gateCopy.textContent = '请先使用飞书身份登录，系统会校验你是否在前端授权名单内。';
+      gateMessage.textContent = query.get('login') === 'failed'
+        ? `飞书登录失败。请确认开发者后台已添加重定向 URL：${me.oauthRedirectUri || '当前页面 /oauth/callback'}`
+        : '登录后即可继续填写光年币领取信息。';
+      loginLink.href = me.loginUrl || `${API_BASE}/oauth/start`;
+      loginLink.hidden = false;
+      return;
+    }
+    if (!me.authorized) {
+      gateTitle.textContent = '暂无访问权限';
+      gateCopy.textContent = '你的飞书账号暂未加入前端授权名单。';
+      gateMessage.textContent = '请联系管理员 @芮婷 添加授权后再使用。';
+      return;
+    }
+    showPage('form');
+  } catch (error) {
+    gateTitle.textContent = '权限校验失败';
+    gateCopy.textContent = '暂时无法连接多维表格服务。';
+    gateMessage.textContent = error.message || '请稍后重试，或联系管理员 @芮婷。';
+    return;
+  }
+
   renderTasks();
   try {
     const taskPayload = await request('/api/tasks');
@@ -285,9 +508,9 @@ form.addEventListener('submit', async (event) => {
     });
 
     if (payload.count > 1) {
-      setMessage(`申请已提交，共 ${payload.count} 人，等待管理员确认`, 'ok');
+      setMessage(`申请已自动入账，共 ${payload.count} 人`, 'ok');
     } else {
-      setMessage('申请已提交，等待管理员确认', 'ok');
+      setMessage('申请已自动入账', 'ok');
     }
 
     populateSuccess(payload, submission);
@@ -312,6 +535,49 @@ form.addEventListener('submit', async (event) => {
     }
   } finally {
     button.disabled = false;
+  }
+});
+
+imageInput.addEventListener('change', () => {
+  recognizeImageFile(imageInput.files && imageInput.files[0]);
+});
+
+pasteZone.addEventListener('paste', (event) => {
+  const item = Array.from(event.clipboardData?.items || []).find((entry) => entry.type.startsWith('image/'));
+  if (!item) {
+    showToast('没有读取到截图', '请先复制图片或表格截图，再粘贴到上传区域。');
+    return;
+  }
+  event.preventDefault();
+  recognizeImageFile(item.getAsFile());
+});
+
+pasteZone.addEventListener('click', () => {
+  pasteZone.focus();
+});
+
+batchEditor.addEventListener('input', (event) => {
+  if (!event.target.matches('.batch-name, .batch-task, .batch-amount')) return;
+  syncBatchRowsFromDom();
+});
+
+batchEditor.addEventListener('click', (event) => {
+  if (event.target.id === 'clearBatchBtn') {
+    state.batchRows = [];
+    renderBatchEditor();
+    setBatchMessage('');
+    return;
+  }
+  if (event.target.id === 'submitBatchBtn') {
+    submitBatchRows();
+    return;
+  }
+  if (event.target.classList.contains('row-remove')) {
+    syncBatchRowsFromDom();
+    const row = event.target.closest('tr');
+    state.batchRows.splice(Number(row.dataset.index), 1);
+    renderBatchEditor();
+    setBatchMessage(state.batchRows.length ? `剩余 ${state.batchRows.length} 条待提交。` : '');
   }
 });
 
