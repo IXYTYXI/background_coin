@@ -1,0 +1,17 @@
+[Unit]
+Description=Guangnian Coin Claim App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=master
+Group=master
+WorkingDirectory=/data/program/background_coin-main
+EnvironmentFile=/data/program/background_coin-main/.env
+ExecStart=/home/master/node-v22.14.0-linux-x64/bin/node /data/program/background_coin-main/server.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
