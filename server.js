@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import path from 'node:path';
+import sharp from 'sharp';
 import { createWorker, PSM } from 'tesseract.js';
 import { fileURLToPath } from 'node:url';
 import {
@@ -1316,7 +1317,9 @@ function cleanOcrText(value) {
 
 function amountFromText(value) {
   const text = cleanOcrText(value).replace(/[,，]/gu, '');
-  const match = text.match(/^(\d{1,5})(?:\s*(?:个|枚|币|光年币))?$/u) || text.match(/(?:^|[\s:：])(\d{1,5})(?:\s*(?:个|枚|币|光年币))?$/u);
+  const match = text.match(/^(\d{1,5})(?:\s*(?:个|枚|币|光年币))?$/u)
+    || text.match(/(?:^|[\s:：])(\d{1,5})(?:\s*(?:个|枚|币|光年币))?$/u)
+    || text.match(/(\d{1,5})(?:\s*(?:个|枚|币|光年币))?\s*$/u);
   if (!match) return null;
   const amount = Number(match[1]);
   return Number.isInteger(amount) && amount > 0 ? amount : null;
@@ -1326,6 +1329,35 @@ function looksLikePersonName(value) {
   const text = cleanOcrText(value);
   if (!text || /\d/u.test(text) || /姓名|人员|任务|数量|部门|光年币/u.test(text)) return false;
   return /^[\u4e00-\u9fa5]{2,5}$/u.test(text) || /^[A-Za-z][A-Za-z .'-]{1,28}$/.test(text);
+}
+
+function looksLikeNoisyPersonName(value) {
+  const text = cleanOcrText(value);
+  if (!text || /姓名|人员|任务|数量|部门|团队|课程|光年币/u.test(text)) return false;
+  const compact = text.replace(/[^A-Za-z\u4e00-\u9fa5]/gu, '');
+  if (compact.length < 2 || compact.length > 8) return false;
+  return /[\u4e00-\u9fa5]/u.test(compact) || /^[A-Za-z][A-Za-z .'-]{1,28}$/.test(text);
+}
+
+function isOcrTableNoise(value) {
+  const text = cleanOcrText(value);
+  if (!text) return true;
+  if (/^\d+$/u.test(text)) return true;
+  if (/^(?:20)?\d{4,6}$/u.test(text)) return true;
+  return /姓名|人员|领取|数量|部门|团队|课程|光年币/u.test(text);
+}
+
+function looksLikePeriodText(value) {
+  const text = cleanOcrText(value).replace(/\D/gu, '');
+  if (!/^\d{4,6}$/u.test(text)) return false;
+  const numeric = Number(text);
+  return Number.isInteger(numeric) && numeric >= 1000;
+}
+
+function amountFromTableCell(value) {
+  if (looksLikePeriodText(value)) return null;
+  const amount = amountFromText(value);
+  return amount && amount <= 999 ? amount : null;
 }
 
 function normalizeTaskText(value) {
@@ -1343,6 +1375,149 @@ function matchTaskName(value, tasks) {
   }) || '';
 }
 
+function extractLeadingName(text) {
+  const cleaned = cleanOcrText(text);
+  const cnMatch = cleaned.match(/^([\u4e00-\u9fa5]{2,5})/u);
+  if (cnMatch && looksLikePersonName(cnMatch[1])) return cnMatch[1];
+  const enMatch = cleaned.match(/^([A-Za-z][A-Za-z .'-]{1,28})/u);
+  if (enMatch && looksLikePersonName(enMatch[1].trim())) return enMatch[1].trim();
+  return null;
+}
+
+function matchLongestTaskInText(text, tasks) {
+  const key = normalizeTaskText(text);
+  if (!key) return '';
+  const sorted = [...tasks].sort((a, b) => normalizeTaskText(b).length - normalizeTaskText(a).length);
+  return sorted.find((task) => {
+    const taskKey = normalizeTaskText(task);
+    return taskKey && (key.includes(taskKey) || taskKey.includes(key));
+  }) || '';
+}
+
+function parseGluedImageRow(row, tasks) {
+  const amount = amountFromText(row);
+  if (!amount) return null;
+  const remainder = cleanOcrText(row).replace(/(\d{1,5})(?:\s*(?:个|枚|币|光年币))?\s*$/u, '').trim();
+  const name = extractLeadingName(remainder);
+  if (!name) return null;
+  const taskText = remainder.slice(name.length).trim();
+  const task = matchTaskName(taskText, tasks) || matchLongestTaskInText(taskText, tasks);
+  return {
+    name,
+    task: task || '',
+    rawTask: task ? '' : taskText,
+    amount,
+    sourceText: row
+  };
+}
+
+function parseImageRecordRow(row, tasks) {
+  if (/姓名|人员|领取|数量|任务|部门/u.test(row) && !/\d/u.test(row)) return null;
+  const parts = row.split(/\t+|\s{2,}|\s+/u).map(cleanOcrText).filter(Boolean);
+  const name = parts.find(looksLikePersonName);
+  const amount = [...parts].reverse().map(amountFromText).find((value) => Number.isInteger(value));
+  if (name && amount) {
+    const taskCandidates = parts.filter((part) => part !== name && amountFromText(part) == null);
+    const joinedTaskText = taskCandidates.join('');
+    const task = taskCandidates.map((part) => matchTaskName(part, tasks)).find(Boolean)
+      || matchLongestTaskInText(joinedTaskText, tasks)
+      || '';
+    return {
+      name,
+      task,
+      rawTask: task ? '' : taskCandidates.join(' '),
+      amount,
+      sourceText: row
+    };
+  }
+  return parseGluedImageRow(row, tasks);
+}
+
+function nearbyAmount(rows, index) {
+  for (let offset = 1; offset <= 3; offset += 1) {
+    const amount = amountFromTableCell(rows[index + offset]);
+    if (amount) return amount;
+  }
+  for (let offset = 1; offset <= 4; offset += 1) {
+    const amount = amountFromTableCell(rows[index - offset]);
+    if (amount) return amount;
+  }
+  return null;
+}
+
+function nearbyName(rows, index) {
+  for (let offset = 1; offset <= 4; offset += 1) {
+    const candidate = rows[index - offset];
+    if (isOcrTableNoise(candidate)) continue;
+    if (looksLikePersonName(candidate) || looksLikeNoisyPersonName(candidate)) return cleanOcrText(candidate);
+  }
+  return '';
+}
+
+function structuredTableRecord(rows, index, task, rawTask) {
+  let name = '';
+  let nameIndex = -1;
+  for (let offset = 1; offset <= 4; offset += 1) {
+    const candidate = rows[index - offset];
+    if (isOcrTableNoise(candidate)) continue;
+    if (looksLikePersonName(candidate) || looksLikeNoisyPersonName(candidate)) {
+      name = cleanOcrText(candidate);
+      nameIndex = index - offset;
+      break;
+    }
+  }
+  if (!name) return null;
+
+  let amount = null;
+  for (let periodIndex = nameIndex - 1; periodIndex >= Math.max(0, nameIndex - 3); periodIndex -= 1) {
+    if (!looksLikePeriodText(rows[periodIndex])) continue;
+    for (let amountIndex = periodIndex - 1; amountIndex >= Math.max(0, periodIndex - 2); amountIndex -= 1) {
+      amount = amountFromTableCell(rows[amountIndex]);
+      if (amount) break;
+    }
+    if (amount) break;
+  }
+  if (!amount) amount = nearbyAmount(rows, index);
+  if (!amount) return null;
+
+  return {
+    name,
+    task: task || '',
+    rawTask: task ? '' : rawTask,
+    amount,
+    sourceText: rows.slice(Math.max(0, nameIndex - 2), Math.min(rows.length, index + 2)).join(' / ')
+  };
+}
+
+function parseMultilineImageRecords(rows, tasks) {
+  const records = [];
+  for (let index = 0; index < rows.length && records.length < MAX_BATCH_ROWS; index += 1) {
+    const row = rows[index];
+    const task = matchTaskName(row, tasks) || matchLongestTaskInText(row, tasks);
+    const looksLikeTaskRow = task || /任务\s*\d+/u.test(row);
+    if (!looksLikeTaskRow) continue;
+
+    const structured = structuredTableRecord(rows, index, task, row);
+    if (structured) {
+      records.push(structured);
+      continue;
+    }
+
+    const name = nearbyName(rows, index);
+    const amount = nearbyAmount(rows, index);
+    if (!name || !amount) continue;
+
+    records.push({
+      name,
+      task: task || '',
+      rawTask: task ? '' : row,
+      amount,
+      sourceText: rows.slice(Math.max(0, index - 4), Math.min(rows.length, index + 4)).join(' / ')
+    });
+  }
+  return records;
+}
+
 function parseImageRecords(text, tasks = []) {
   const rows = String(text || '')
     .replace(/\r/g, '\n')
@@ -1353,38 +1528,74 @@ function parseImageRecords(text, tasks = []) {
 
   for (const row of rows) {
     if (records.length >= MAX_BATCH_ROWS) break;
-    if (/姓名|人员|领取|数量|任务|部门/u.test(row) && !/\d/u.test(row)) continue;
-    const parts = row.split(/\t+|\s{2,}|\s+/u).map(cleanOcrText).filter(Boolean);
-    const name = parts.find(looksLikePersonName);
-    const amount = [...parts].reverse().map(amountFromText).find((value) => Number.isInteger(value));
-    if (!name || !amount) continue;
-    const taskCandidates = parts.filter((part) => part !== name && amountFromText(part) == null);
-    const task = taskCandidates.map((part) => matchTaskName(part, tasks)).find(Boolean) || '';
-    records.push({
-      name,
-      task,
-      rawTask: task ? '' : taskCandidates.join(' '),
-      amount,
-      sourceText: row
-    });
+    const record = parseImageRecordRow(row, tasks);
+    if (record) records.push(record);
   }
-  return records;
+  return records.length ? records : parseMultilineImageRecords(rows, tasks);
 }
 
 async function getOcrWorker() {
   if (!ocrWorkerPromise) {
     // OCR worker 初始化较慢，因此做进程级复用；轻量版单服务部署下保持一个 worker 足够。
-    ocrWorkerPromise = createWorker(['chi_sim', 'eng'], 1, {
-      logger: () => {}
+    // 语言组合使用 chi_sim+eng 字符串，避免数组形式在 tesseract.js 初始化时解析异常。
+    ocrWorkerPromise = createWorker('chi_sim+eng', 1, {
+      logger: () => {},
+      errorHandler: (error) => console.error('OCR worker 错误:', error)
     }).then(async (worker) => {
       await worker.setParameters({
         tessedit_pageseg_mode: PSM.SPARSE_TEXT,
-        preserve_interword_spaces: '1'
+        preserve_interword_spaces: '1',
+        user_defined_dpi: '300'
       });
       return worker;
+    }).catch((error) => {
+      ocrWorkerPromise = undefined;
+      throw error;
     });
   }
   return ocrWorkerPromise;
+}
+
+async function recognizeFeishuImage(buffer) {
+  const data = await requestLark({
+    method: 'POST',
+    url: '/open-apis/optical_char_recognition/v1/image/basic_recognize',
+    data: { image: buffer.toString('base64') }
+  });
+  const textList = Array.isArray(data.text_list) ? data.text_list : [];
+  return {
+    text: textList.join('\n'),
+    engine: 'feishu'
+  };
+}
+
+async function recognizeTesseractImage(buffer) {
+  const worker = await getOcrWorker();
+  const ocrBuffer = await preprocessOcrImage(buffer);
+  const result = await worker.recognize(ocrBuffer);
+  return {
+    text: result?.data?.text || '',
+    engine: 'tesseract'
+  };
+}
+
+async function preprocessOcrImage(buffer) {
+  try {
+    const image = sharp(buffer, { limitInputPixels: 50_000_000 });
+    const metadata = await image.metadata();
+    const width = metadata.width || 0;
+    const resizeWidth = width && width < 2200 ? Math.min(2600, Math.round(width * 2.5)) : undefined;
+    return await image
+      .resize(resizeWidth ? { width: resizeWidth, kernel: sharp.kernel.lanczos3 } : undefined)
+      .grayscale()
+      .normalize()
+      .sharpen()
+      .png()
+      .toBuffer();
+  } catch (error) {
+    console.warn('OCR 图片预处理失败，使用原图识别:', error?.message || error);
+    return buffer;
+  }
 }
 
 async function recognizeClaimImage(image) {
@@ -1393,16 +1604,34 @@ async function recognizeClaimImage(image) {
   const buffer = imageBufferFromDataUrl(image);
   if (!buffer) throw new Error('请上传 png、jpg、jpeg 或 webp 图片');
   if (buffer.length > MAX_IMAGE_BYTES) throw new Error('图片不能超过 8MB');
-  const tasks = await getTasks();
-  const worker = await getOcrWorker();
-  const result = await worker.recognize(buffer);
-  const text = result?.data?.text || '';
-  return {
-    text,
-    records: parseImageRecords(text, tasks),
-    tasks,
-    engine: 'tesseract'
-  };
+  try {
+    const tasks = await getTasks();
+    let text = '';
+    let engine = 'feishu';
+    try {
+      ({ text, engine } = await recognizeFeishuImage(buffer));
+    } catch (error) {
+      console.warn('飞书 OCR 失败，回退到本地 Tesseract:', error?.message || error);
+      ({ text, engine } = await recognizeTesseractImage(buffer));
+    }
+    if (!text.trim()) {
+      ({ text, engine } = await recognizeTesseractImage(buffer));
+    }
+    const records = parseImageRecords(text, tasks);
+    if (!records.length && text.trim()) {
+      console.warn(`图片 OCR 完成但未解析出记录（${engine}），原始文本预览:`, text.slice(0, 500));
+    }
+    return {
+      text,
+      records,
+      tasks,
+      engine
+    };
+  } catch (error) {
+    console.error('图片识别失败:', error?.message || error);
+    if (error?.stack) console.error(error.stack);
+    throw error;
+  }
 }
 
 async function handleApi(req, res, pathname) {
@@ -1479,7 +1708,13 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'POST' && pathname === '/api/claim-image/recognize') {
     assertRateLimit(req, 'ocr', 6);
     const { image } = await readJson(req);
-    const result = await recognizeClaimImage(image);
+    let result;
+    try {
+      result = await recognizeClaimImage(image);
+    } catch (error) {
+      console.error('图片识别接口失败:', error?.message || error);
+      throw error;
+    }
     return sendJson(req, res, 200, {
       ok: true,
       text: result.text,
