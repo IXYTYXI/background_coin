@@ -129,6 +129,16 @@ function ensureBatchKeys(rows = []) {
   }));
 }
 
+function batchPersonMeta(row) {
+  if (row.person?.id) {
+    return `<small class="batch-person ok">已匹配人员字段：${escapeHtml(row.person.name || row.name)}</small>`;
+  }
+  if (row.matchStatus === 'unmatched' || row.matchStatus === 'ambiguous') {
+    return `<small class="batch-warning">${escapeHtml(row.matchMessage || '未匹配到人员字段，请修正姓名后提交')}</small>`;
+  }
+  return '';
+}
+
 function syncManualClaimVisibility() {
   manualClaimPanel.hidden = state.batchRows.length > 0;
 }
@@ -176,7 +186,10 @@ function renderBatchEditor() {
         <tbody>
           ${state.batchRows.map((row, index) => `
             <tr data-index="${index}">
-              <td><input class="batch-name" value="${escapeHtml(row.name)}" aria-label="人员姓名" /></td>
+              <td>
+                <input class="batch-name" value="${escapeHtml(row.name)}" data-original-name="${escapeHtml(row.name)}" aria-label="人员姓名" />
+                ${batchPersonMeta(row)}
+              </td>
               <td>
                 <select class="batch-task" aria-label="任务">
                   ${taskOptionsHtml(row.task)}
@@ -202,7 +215,10 @@ function syncBatchRowsFromDom() {
       name: row.querySelector('.batch-name').value.trim(),
       task: row.querySelector('.batch-task').value,
       amount: Number(row.querySelector('.batch-amount').value),
-      rawTask: state.batchRows[index]?.rawTask || ''
+      rawTask: state.batchRows[index]?.rawTask || '',
+      person: row.querySelector('.batch-name').value.trim() === row.querySelector('.batch-name').dataset.originalName
+        ? state.batchRows[index]?.person
+        : null
     };
   });
 }
@@ -259,6 +275,7 @@ async function submitBatchRows() {
         items: state.batchRows.map((row) => ({
           key: row.key,
           name: row.name,
+          person: row.person || null,
           task: row.task,
           amount: Number(row.amount)
         })),
