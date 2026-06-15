@@ -8,11 +8,25 @@
   </head>
   <body>
     <main class="shell">
-      <section class="page page-form" id="formPage">
+      <section class="page page-gate" id="gatePage">
+        <div class="hero">
+          <p class="eyebrow">Guangnian Coin</p>
+          <h1 id="gateTitle">正在校验权限</h1>
+          <p id="gateCopy" class="hero-copy">正在确认你的飞书身份和页面访问权限。</p>
+        </div>
+
+        <div class="card gate-card">
+          <p id="gateMessage" class="gate-message">请稍候。</p>
+          <a id="loginLink" class="primary gate-login" href="/oauth/start" hidden>飞书登录</a>
+          <p class="success-footnote">有问题联系管理员 @芮婷</p>
+        </div>
+      </section>
+
+      <section class="page page-form" id="formPage" hidden>
         <div class="hero">
           <p class="eyebrow">Guangnian Coin</p>
           <h1>光年币领取</h1>
-          <p class="hero-copy">填写人员、领取数量和任务，提交后会自动进入多维表格流转。</p>
+          <p class="hero-copy">白名单用户填写或批量上传后，系统会自动确认光年币入账。</p>
         </div>
 
         <div class="card">
@@ -23,32 +37,53 @@
             </div>
           </div>
 
-          <form id="claimForm" class="claim-form">
-            <label>
-              <span>人员</span>
-              <textarea id="peopleInput" placeholder="输入姓名，多个姓名可换行或用逗号分隔" required></textarea>
-            </label>
-
-            <label>
-              <span>领取数量</span>
-              <input id="amountInput" type="number" min="1" step="1" value="10" required />
-            </label>
-
-            <label>
-              <span>任务</span>
-              <select id="taskSelect" required></select>
-            </label>
-
-            <div class="helper-row">
-              <p class="helper-text">如遇重名，请在下方选择对应人员后再提交。</p>
-              <p class="helper-text">问题联系管理员 <strong>@芮婷</strong></p>
+          <section class="batch-panel" aria-labelledby="batchTitle">
+            <div class="batch-head">
+              <div>
+                <p class="section-kicker">Batch Upload</p>
+                <h3 id="batchTitle">图片批量上传</h3>
+              </div>
+              <label class="upload-button">
+                <input id="imageInput" type="file" accept="image/png,image/jpeg,image/jpg,image/webp" />
+                上传图片
+              </label>
             </div>
+            <div id="pasteZone" class="paste-zone" tabindex="0">
+              <strong>粘贴截图</strong>
+              <span>复制表格截图后点击这里按 ⌘V / Ctrl+V，最多识别 20 条。</span>
+            </div>
+            <p id="batchMessage" class="message"></p>
+            <div id="batchEditor" class="batch-editor" hidden></div>
+          </section>
 
-            <div id="selectionPanel" class="selection-panel" hidden></div>
+          <div id="manualClaimPanel">
+            <form id="claimForm" class="claim-form">
+              <label>
+                <span>人员</span>
+                <textarea id="peopleInput" placeholder="输入姓名，多个姓名可换行或用逗号分隔" required></textarea>
+              </label>
 
-            <button class="primary" type="submit">提交领取申请</button>
-            <p id="formMessage" class="message"></p>
-          </form>
+              <label>
+                <span>领取数量</span>
+                <input id="amountInput" type="number" min="1" step="1" value="10" required />
+              </label>
+
+              <label>
+                <span>任务</span>
+                <select id="taskSelect" required></select>
+              </label>
+
+              <div class="helper-row">
+                <p class="helper-text">如遇重名，请在下方选择对应人员后再提交。</p>
+                <p class="helper-text">问题联系管理员 <strong>@芮婷</strong></p>
+              </div>
+
+              <div id="selectionPanel" class="selection-panel" hidden></div>
+
+              <button class="primary" type="submit">提交领取申请</button>
+              <p id="formMessage" class="message"></p>
+            </form>
+          </div>
         </div>
       </section>
 

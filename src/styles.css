@@ -210,11 +210,22 @@ h3 {
 
 .paste-zone span,
 .batch-toolbar p,
+.batch-person,
 .batch-warning {
   margin: 0;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.batch-person,
+.batch-warning {
+  display: block;
+  margin-top: 6px;
+}
+
+.batch-person.ok {
+  color: #12805c;
 }
 
 .batch-editor {

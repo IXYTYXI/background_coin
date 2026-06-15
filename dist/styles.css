@@ -127,6 +127,160 @@ h2 {
   gap: 18px;
 }
 
+.gate-card {
+  display: grid;
+  gap: 18px;
+}
+
+.gate-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.gate-login {
+  display: inline-grid;
+  place-items: center;
+  width: fit-content;
+  min-width: 160px;
+  text-decoration: none;
+}
+
+.batch-panel {
+  display: grid;
+  gap: 14px;
+  padding-bottom: 22px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--line);
+}
+
+.batch-head,
+.batch-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+h3 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.upload-button {
+  display: inline-grid;
+  place-items: center;
+  min-width: 112px;
+  height: 42px;
+  padding: 0 16px;
+  border-radius: 999px;
+  background: var(--blue);
+  color: #fff;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.upload-button input {
+  display: none;
+}
+
+.paste-zone {
+  display: grid;
+  gap: 6px;
+  min-height: 92px;
+  padding: 18px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+
+.paste-zone:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 4px rgba(22, 119, 255, 0.12);
+}
+
+.paste-zone strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.paste-zone span,
+.batch-toolbar p,
+.batch-person,
+.batch-warning {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.batch-person,
+.batch-warning {
+  display: block;
+  margin-top: 6px;
+}
+
+.batch-person.ok {
+  color: #12805c;
+}
+
+.batch-editor {
+  display: grid;
+  gap: 14px;
+}
+
+.batch-editor[hidden] {
+  display: none;
+}
+
+.text-button,
+.row-remove {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--text);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.text-button {
+  height: 34px;
+  padding: 0 12px;
+}
+
+.batch-table-wrap {
+  overflow-x: auto;
+}
+
+.batch-table {
+  width: 100%;
+  min-width: 640px;
+  border-collapse: collapse;
+}
+
+.batch-table th,
+.batch-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.batch-table th {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.row-remove {
+  height: 36px;
+  padding: 0 12px;
+  color: var(--red);
+}
+
 label {
   display: grid;
   gap: 8px;

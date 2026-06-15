@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -12,8 +12,30 @@ import {
   readSessionCookie,
   serializeExpiredSessionCookie
 } from './lib/session.js';
+import { parseImageRecords } from './lib/ocr-parser.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function loadEnvFile(filePath = path.join(__dirname, '.env')) {
+  if (!existsSync(filePath)) return;
+  const lines = readFileSync(filePath, 'utf8').split(/\r?\n/u);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u);
+    if (!match || process.env[match[1]] != null) continue;
+    let value = match[2].trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    process.env[match[1]] = value;
+  }
+}
+
+loadEnvFile();
 
 // 以下配置全部支持环境变量覆盖，便于同一份代码部署到不同服务器或多维表格。
 // 代码中的默认值只保留原项目历史配置，生产环境建议全部显式写入 .env。
@@ -72,7 +94,13 @@ let whitelistCache = null;
 let larkClient;
 let ocrWorkerPromise;
 
-const cardActionHandler = new Lark.CardActionHandler({ loggerLevel: Lark.LoggerLevel.warn }, handleApprovalAction);
+function safeErrorMessage(error) {
+  return error?.response?.data?.msg ||
+    error?.response?.data?.message ||
+    error?.msg ||
+    error?.message ||
+    '未知错误';
+}
 
 function rememberClaim(claim) {
   if (!claim?.serial) return claim;
@@ -90,7 +118,7 @@ function getLarkClient() {
       appSecret: LARK_APP_SECRET,
       appType: Lark.AppType.SelfBuild,
       domain: Lark.Domain.Feishu,
-      loggerLevel: Lark.LoggerLevel.warn
+      loggerLevel: Lark.LoggerLevel.fatal
     });
   }
   return larkClient;
@@ -354,13 +382,14 @@ async function getAccounts() {
   while (true) {
     const data = await listRecords(
       ACCOUNT_TABLE,
-      [FIELD.accountName, FIELD.accountPerson, FIELD.accountBalance],
+      [FIELD.accountName, FIELD.accountPerson, FIELD.accountBalance, FIELD.accountStatus],
       200,
       offset
     );
     const records = data.data || [];
     const ids = data.record_id_list || [];
     records.forEach((row, index) => {
+      if (cellText(row[3]) === '停用') return;
       const user = firstUser(row[1]);
       rows.push({
         id: ids[index],
@@ -419,16 +448,21 @@ async function searchUsersByNames(names) {
   const users = [];
   const queries = [];
   for (const name of names) {
-    const data = await requestLark({
-      method: 'GET',
-      url: '/open-apis/search/v1/user',
-      params: {
-        query: name,
-        page_size: 20
-      }
-    });
-    users.push(...(data.users || []).map((user) => normalizeUser(user, name)));
-    queries.push({ query: name, has_more: Boolean(data.has_more) });
+    try {
+      const data = await requestLark({
+        method: 'GET',
+        url: '/open-apis/search/v1/user',
+        params: {
+          query: name,
+          page_size: 20
+        }
+      });
+      users.push(...(data.users || []).map((user) => normalizeUser(user, name)));
+      queries.push({ query: name, has_more: Boolean(data.has_more) });
+    } catch (error) {
+      if (!/status code 400|invalid|bad request/i.test(error?.message || '')) throw error;
+      queries.push({ query: name, has_more: false });
+    }
   }
   return { users, queries };
 }
@@ -736,6 +770,69 @@ async function resolveClaimAccounts(people, accounts, selectedUsers = {}) {
   const updatedAccounts = await updateAccountsFromUsers(accountUserPairs);
   const newAccounts = await createAccountsFromUsers(usersToCreate);
   return { accounts: [...selectedAccounts, ...updatedAccounts, ...newAccounts] };
+}
+
+function accountPersonPayload(account) {
+  if (!account?.userId || !account?.id) return null;
+  return {
+    id: account.userId,
+    accountId: account.id,
+    name: account.userName || account.name,
+    accountName: account.name,
+    fieldValue: [{ id: account.userId }]
+  };
+}
+
+async function resolveOcrRecords(records) {
+  if (!records.length) return records;
+  const accounts = await getAccounts();
+  const resolvedRows = [];
+  for (const [index, record] of records.entries()) {
+    const name = normalizeName(record.name);
+    if (!name) {
+      resolvedRows.push({
+        ...record,
+        matchStatus: 'unmatched',
+        matchMessage: `第 ${index + 1} 行缺少人员姓名`
+      });
+      continue;
+    }
+
+    const match = matchPeopleToAccounts([name], accounts)[0];
+    const linkedAccounts = (match?.candidates || []).filter((account) => account.userId);
+    const emptyAccounts = (match?.candidates || []).filter((account) => !account.userId);
+    if (linkedAccounts.length > 1) {
+      resolvedRows.push({
+        ...record,
+        matchStatus: 'ambiguous',
+        matchMessage: '识别到账户表里存在多个匹配人员，请选择对应人员',
+        candidates: await accountOptions(linkedAccounts)
+      });
+      continue;
+    }
+    if (!linkedAccounts.length) {
+      resolvedRows.push({
+        ...record,
+        matchStatus: 'unmatched',
+        matchMessage: emptyAccounts.length
+          ? `账户表里的「${name}」还没有绑定人员字段`
+          : `未匹配到账户人员字段：${name}`
+      });
+      continue;
+    }
+
+    const person = accountPersonPayload(linkedAccounts[0]);
+    resolvedRows.push({
+      ...record,
+      name: person.name || name,
+      ocrName: name,
+      person,
+      accountId: person.accountId,
+      userId: person.id,
+      matchStatus: 'matched'
+    });
+  }
+  return resolvedRows;
 }
 
 function jsonHeaders(req) {
@@ -1155,7 +1252,7 @@ async function sendApprovalCard(claim) {
       }
     }));
   } catch (error) {
-    console.error(error.message);
+    console.error(safeErrorMessage(error));
   }
 }
 
@@ -1207,11 +1304,11 @@ async function handleApprovalAction(event) {
 }
 
 process.on('unhandledRejection', (error) => {
-  console.error(error?.message || error);
+  console.error(safeErrorMessage(error));
 });
 
 process.on('uncaughtException', (error) => {
-  console.error(error?.message || error);
+  console.error(safeErrorMessage(error));
 });
 
 async function handleReview(req, res, url) {
@@ -1308,232 +1405,6 @@ function imageBufferFromDataUrl(image) {
   return buffer.length ? buffer : null;
 }
 
-function cleanOcrText(value) {
-  return normalizeName(value)
-    .replace(/[|｜]/gu, ' ')
-    .replace(/[“”"'`]/gu, '')
-    .trim();
-}
-
-function amountFromText(value) {
-  const text = cleanOcrText(value).replace(/[,，]/gu, '');
-  const match = text.match(/^(\d{1,5})(?:\s*(?:个|枚|币|光年币))?$/u)
-    || text.match(/(?:^|[\s:：])(\d{1,5})(?:\s*(?:个|枚|币|光年币))?$/u)
-    || text.match(/(\d{1,5})(?:\s*(?:个|枚|币|光年币))?\s*$/u);
-  if (!match) return null;
-  const amount = Number(match[1]);
-  return Number.isInteger(amount) && amount > 0 ? amount : null;
-}
-
-function looksLikePersonName(value) {
-  const text = cleanOcrText(value);
-  if (!text || /\d/u.test(text) || /姓名|人员|任务|数量|部门|光年币/u.test(text)) return false;
-  return /^[\u4e00-\u9fa5]{2,5}$/u.test(text) || /^[A-Za-z][A-Za-z .'-]{1,28}$/.test(text);
-}
-
-function looksLikeNoisyPersonName(value) {
-  const text = cleanOcrText(value);
-  if (!text || /姓名|人员|任务|数量|部门|团队|课程|光年币/u.test(text)) return false;
-  const compact = text.replace(/[^A-Za-z\u4e00-\u9fa5]/gu, '');
-  if (compact.length < 2 || compact.length > 8) return false;
-  return /[\u4e00-\u9fa5]/u.test(compact) || /^[A-Za-z][A-Za-z .'-]{1,28}$/.test(text);
-}
-
-function isOcrTableNoise(value) {
-  const text = cleanOcrText(value);
-  if (!text) return true;
-  if (/^\d+$/u.test(text)) return true;
-  if (/^(?:20)?\d{4,6}$/u.test(text)) return true;
-  return /姓名|人员|领取|数量|部门|团队|课程|光年币/u.test(text);
-}
-
-function looksLikePeriodText(value) {
-  const text = cleanOcrText(value).replace(/\D/gu, '');
-  if (!/^\d{4,6}$/u.test(text)) return false;
-  const numeric = Number(text);
-  return Number.isInteger(numeric) && numeric >= 1000;
-}
-
-function amountFromTableCell(value) {
-  if (looksLikePeriodText(value)) return null;
-  const amount = amountFromText(value);
-  return amount && amount <= 999 ? amount : null;
-}
-
-function normalizeTaskText(value) {
-  return cleanOcrText(value)
-    .replace(/[｜|【】\[\]（）()<>《》「」『』:：,，.。·、/／\\_\-\s]/gu, '')
-    .toLocaleLowerCase('zh-Hans-CN');
-}
-
-function matchTaskName(value, tasks) {
-  const key = normalizeTaskText(value);
-  if (!key) return '';
-  return tasks.find((task) => {
-    const taskKey = normalizeTaskText(task);
-    return taskKey === key || taskKey.includes(key) || key.includes(taskKey);
-  }) || '';
-}
-
-function extractLeadingName(text) {
-  const cleaned = cleanOcrText(text);
-  const cnMatch = cleaned.match(/^([\u4e00-\u9fa5]{2,5})/u);
-  if (cnMatch && looksLikePersonName(cnMatch[1])) return cnMatch[1];
-  const enMatch = cleaned.match(/^([A-Za-z][A-Za-z .'-]{1,28})/u);
-  if (enMatch && looksLikePersonName(enMatch[1].trim())) return enMatch[1].trim();
-  return null;
-}
-
-function matchLongestTaskInText(text, tasks) {
-  const key = normalizeTaskText(text);
-  if (!key) return '';
-  const sorted = [...tasks].sort((a, b) => normalizeTaskText(b).length - normalizeTaskText(a).length);
-  return sorted.find((task) => {
-    const taskKey = normalizeTaskText(task);
-    return taskKey && (key.includes(taskKey) || taskKey.includes(key));
-  }) || '';
-}
-
-function parseGluedImageRow(row, tasks) {
-  const amount = amountFromText(row);
-  if (!amount) return null;
-  const remainder = cleanOcrText(row).replace(/(\d{1,5})(?:\s*(?:个|枚|币|光年币))?\s*$/u, '').trim();
-  const name = extractLeadingName(remainder);
-  if (!name) return null;
-  const taskText = remainder.slice(name.length).trim();
-  const task = matchTaskName(taskText, tasks) || matchLongestTaskInText(taskText, tasks);
-  return {
-    name,
-    task: task || '',
-    rawTask: task ? '' : taskText,
-    amount,
-    sourceText: row
-  };
-}
-
-function parseImageRecordRow(row, tasks) {
-  if (/姓名|人员|领取|数量|任务|部门/u.test(row) && !/\d/u.test(row)) return null;
-  const parts = row.split(/\t+|\s{2,}|\s+/u).map(cleanOcrText).filter(Boolean);
-  const name = parts.find(looksLikePersonName);
-  const amount = [...parts].reverse().map(amountFromText).find((value) => Number.isInteger(value));
-  if (name && amount) {
-    const taskCandidates = parts.filter((part) => part !== name && amountFromText(part) == null);
-    const joinedTaskText = taskCandidates.join('');
-    const task = taskCandidates.map((part) => matchTaskName(part, tasks)).find(Boolean)
-      || matchLongestTaskInText(joinedTaskText, tasks)
-      || '';
-    return {
-      name,
-      task,
-      rawTask: task ? '' : taskCandidates.join(' '),
-      amount,
-      sourceText: row
-    };
-  }
-  return parseGluedImageRow(row, tasks);
-}
-
-function nearbyAmount(rows, index) {
-  for (let offset = 1; offset <= 3; offset += 1) {
-    const amount = amountFromTableCell(rows[index + offset]);
-    if (amount) return amount;
-  }
-  for (let offset = 1; offset <= 4; offset += 1) {
-    const amount = amountFromTableCell(rows[index - offset]);
-    if (amount) return amount;
-  }
-  return null;
-}
-
-function nearbyName(rows, index) {
-  for (let offset = 1; offset <= 4; offset += 1) {
-    const candidate = rows[index - offset];
-    if (isOcrTableNoise(candidate)) continue;
-    if (looksLikePersonName(candidate) || looksLikeNoisyPersonName(candidate)) return cleanOcrText(candidate);
-  }
-  return '';
-}
-
-function structuredTableRecord(rows, index, task, rawTask) {
-  let name = '';
-  let nameIndex = -1;
-  for (let offset = 1; offset <= 4; offset += 1) {
-    const candidate = rows[index - offset];
-    if (isOcrTableNoise(candidate)) continue;
-    if (looksLikePersonName(candidate) || looksLikeNoisyPersonName(candidate)) {
-      name = cleanOcrText(candidate);
-      nameIndex = index - offset;
-      break;
-    }
-  }
-  if (!name) return null;
-
-  let amount = null;
-  for (let periodIndex = nameIndex - 1; periodIndex >= Math.max(0, nameIndex - 3); periodIndex -= 1) {
-    if (!looksLikePeriodText(rows[periodIndex])) continue;
-    for (let amountIndex = periodIndex - 1; amountIndex >= Math.max(0, periodIndex - 2); amountIndex -= 1) {
-      amount = amountFromTableCell(rows[amountIndex]);
-      if (amount) break;
-    }
-    if (amount) break;
-  }
-  if (!amount) amount = nearbyAmount(rows, index);
-  if (!amount) return null;
-
-  return {
-    name,
-    task: task || '',
-    rawTask: task ? '' : rawTask,
-    amount,
-    sourceText: rows.slice(Math.max(0, nameIndex - 2), Math.min(rows.length, index + 2)).join(' / ')
-  };
-}
-
-function parseMultilineImageRecords(rows, tasks) {
-  const records = [];
-  for (let index = 0; index < rows.length && records.length < MAX_BATCH_ROWS; index += 1) {
-    const row = rows[index];
-    const task = matchTaskName(row, tasks) || matchLongestTaskInText(row, tasks);
-    const looksLikeTaskRow = task || /任务\s*\d+/u.test(row);
-    if (!looksLikeTaskRow) continue;
-
-    const structured = structuredTableRecord(rows, index, task, row);
-    if (structured) {
-      records.push(structured);
-      continue;
-    }
-
-    const name = nearbyName(rows, index);
-    const amount = nearbyAmount(rows, index);
-    if (!name || !amount) continue;
-
-    records.push({
-      name,
-      task: task || '',
-      rawTask: task ? '' : row,
-      amount,
-      sourceText: rows.slice(Math.max(0, index - 4), Math.min(rows.length, index + 4)).join(' / ')
-    });
-  }
-  return records;
-}
-
-function parseImageRecords(text, tasks = []) {
-  const rows = String(text || '')
-    .replace(/\r/g, '\n')
-    .split('\n')
-    .map(cleanOcrText)
-    .filter(Boolean);
-  const records = [];
-
-  for (const row of rows) {
-    if (records.length >= MAX_BATCH_ROWS) break;
-    const record = parseImageRecordRow(row, tasks);
-    if (record) records.push(record);
-  }
-  return records.length ? records : parseMultilineImageRecords(rows, tasks);
-}
-
 async function getOcrWorker() {
   if (!ocrWorkerPromise) {
     // OCR worker 初始化较慢，因此做进程级复用；轻量版单服务部署下保持一个 worker 足够。
@@ -1623,7 +1494,7 @@ async function recognizeClaimImage(image) {
     }
     return {
       text,
-      records,
+      records: await resolveOcrRecords(records),
       tasks,
       engine
     };
@@ -1743,18 +1614,42 @@ async function handleApi(req, res, pathname) {
         const selectedTask = normalizeName(item.task);
         const numericAmount = Number(item.amount);
         const key = normalizeName(item.key) || `row:${index + 1}`;
-        if (!name) throw new Error(`第 ${index + 1} 行缺少人员姓名`);
+        const personId = normalizeName(item.person?.id || item.userId);
+        const personAccountId = normalizeName(item.person?.accountId || item.accountId);
+        if (!name && !personId) throw new Error(`第 ${index + 1} 行缺少人员姓名`);
         if (!Number.isInteger(numericAmount) || numericAmount <= 0) {
           throw new Error(`第 ${index + 1} 行领取数量只能填写正整数`);
         }
         if (!selectedTask || !tasks.includes(selectedTask)) {
           throw new Error(`第 ${index + 1} 行请选择有效任务`);
         }
-        return { key, name, amount: numericAmount, task: selectedTask };
+        return {
+          key,
+          name,
+          amount: numericAmount,
+          task: selectedTask,
+          personId,
+          personAccountId
+        };
       });
 
       const accounts = await getAccounts();
-      const resolved = await resolveClaimAccounts(normalizedItems.map((item) => item.name), accounts, selectedUsers);
+      const directItems = [];
+      const unresolvedItems = [];
+      normalizedItems.forEach((item) => {
+        const account = item.personAccountId
+          ? accounts.find((candidate) => candidate.id === item.personAccountId && candidate.userId === item.personId)
+          : null;
+        if (account) {
+          directItems.push({ ...item, account });
+        } else {
+          unresolvedItems.push(item);
+        }
+      });
+
+      const resolved = unresolvedItems.length
+        ? await resolveClaimAccounts(unresolvedItems.map((item) => item.name), accounts, selectedUsers)
+        : { accounts: [] };
       if (resolved.selectionRequired) {
         return sendJson(req, res, 409, {
           code: 'SELECTION_REQUIRED',
@@ -1764,9 +1659,12 @@ async function handleApi(req, res, pathname) {
       }
       if (resolved.error) return sendJson(req, res, 400, { error: resolved.error });
       const resolvedAccountByName = accountLookupByName(resolved.accounts || []);
-      const claimItems = normalizedItems.map((item) => ({
+      const resolvedItems = unresolvedItems.map((item) => ({
         ...item,
-        account: resolvedAccountByName.get(item.name.toLocaleLowerCase('zh-Hans-CN')),
+        account: resolvedAccountByName.get(item.name.toLocaleLowerCase('zh-Hans-CN'))
+      }));
+      const claimItems = [...directItems, ...resolvedItems].map((item) => ({
+        ...item,
         serial: `GN-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
       })).filter((item) => item.account?.userId);
       if (claimItems.length !== normalizedItems.length) {
@@ -1879,7 +1777,7 @@ createServer(async (req, res) => {
     }
   } catch (error) {
     const statusCode = Number(error.statusCode || 500);
-    sendJson(req, res, statusCode, { error: error.message });
+    sendJson(req, res, statusCode, { error: safeErrorMessage(error) });
   }
 }).listen(port, () => {
   console.log(`光年币领取系统已启动：http://localhost:${port}`);
