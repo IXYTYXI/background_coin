@@ -13,6 +13,13 @@ import {
   serializeExpiredSessionCookie
 } from './lib/session.js';
 import { parseImageRecords } from './lib/ocr-parser.js';
+import {
+  assertCallbackVerificationToken,
+  isEncryptedCallbackPayload
+} from './lib/lark-callback.js';
+import { parseWithdrawCommand } from './lib/withdraw-command.js';
+import { withdrawDigest } from './lib/withdraw-digest.js';
+import { WithdrawCompletionRegistry } from './lib/withdraw-idempotency.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,18 +49,25 @@ loadEnvFile();
 const BASE_TOKEN = process.env.BASE_TOKEN || 'KrVRbjTKOatunlslgHlcdPyindc';
 const LEDGER_TABLE = process.env.LEDGER_TABLE || 'tbl88pkryfLsRNNk';
 const ACCOUNT_TABLE = process.env.ACCOUNT_TABLE || 'tblcvlBAmioZD4CJ';
+const WITHDRAW_TABLE = process.env.WITHDRAW_TABLE || 'tblP1pNflMJGHDgf';
 const WHITELIST_TABLE = process.env.WHITELIST_TABLE || 'tbleU3I3ejRn3sTj';
-const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'ou_64a560dfa39a4acbfce6eee29a08fb3a';
-const LARK_APP_ID = process.env.FEISHU_APP_ID || 'cli_a956e0b1eb3bdbc9';
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'ou_0666dc75244dd56bbbad486f995caf1f';
+const LARK_APP_ID = process.env.FEISHU_APP_ID || 'cli_aaba740b6939dbb7';
 const LARK_APP_SECRET = process.env.FEISHU_APP_SECRET;
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
+const LARK_VERIFICATION_TOKEN = process.env.LARK_VERIFICATION_TOKEN || process.env.FEISHU_VERIFICATION_TOKEN || '';
+const LARK_ENCRYPT_KEY = process.env.LARK_ENCRYPT_KEY || process.env.FEISHU_ENCRYPT_KEY || '';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const MAX_BATCH_ROWS = 20;
 const MAX_JSON_BYTES = 12 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const WITHDRAW_POLL_INTERVAL_MS = Number(process.env.WITHDRAW_POLL_INTERVAL_MS || 60 * 1000);
+const WITHDRAW_POLL_ENABLED = process.env.WITHDRAW_POLL_ENABLED !== 'false';
+const LARK_WS_EVENTS_ENABLED = process.env.LARK_WS_EVENTS_ENABLED !== 'false';
+const WITHDRAW_WEBHOOK_TOKEN = process.env.WITHDRAW_WEBHOOK_TOKEN || SESSION_SECRET || '';
 const rateLimitBuckets = new Map();
 const FEISHU_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
 const FEISHU_OAUTH_TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
@@ -72,6 +86,14 @@ const FIELD = {
   accountPerson: 'fldaCZqNY4',
   accountBalance: 'fldq1dWxL5',
   accountStatus: 'fldcRghGZ7',
+  accountWithdraws: 'fldTq9ZhiA',
+  withdrawSerial: process.env.WITHDRAW_SERIAL_FIELD || 'fldNvlM3Q8',
+  withdrawPerson: process.env.WITHDRAW_PERSON_FIELD || 'fldMh5eZJx',
+  withdrawAccount: process.env.WITHDRAW_ACCOUNT_FIELD || 'fldMBp5NJI',
+  withdrawAmount: process.env.WITHDRAW_AMOUNT_FIELD || 'flddN5H2om',
+  withdrawBeforeBalance: process.env.WITHDRAW_BEFORE_BALANCE_FIELD || 'fldYaKq6dU',
+  withdrawAfterBalance: process.env.WITHDRAW_AFTER_BALANCE_FIELD || 'fldHoUYMSx',
+  withdrawTime: process.env.WITHDRAW_TIME_FIELD || 'fld80lEU6y',
   frontendWhitelistPerson: process.env.WHITELIST_PERSON_FIELD || 'fldqSinMmy'
 };
 
@@ -90,9 +112,23 @@ const reviewActionText = {
 const claimCache = new Map();
 const fieldCache = new Map();
 const oauthStateCache = new Map();
+const withdrawCache = new Map();
+const withdrawCompletionRegistry = new WithdrawCompletionRegistry();
+const processedEventIds = new Map();
+const seenWithdrawRecordDigests = new Map();
+let withdrawPollInitialized = false;
+let withdrawPollRunning = false;
 let whitelistCache = null;
 let larkClient;
+let larkWsClient;
 let ocrWorkerPromise;
+
+const cardActionHandler = new Lark.CardActionHandler({
+  // HTTP 入口先做 token 校验；SDK 在这里负责解密和适配不同卡片回调形态。
+  verificationToken: undefined,
+  encryptKey: LARK_ENCRYPT_KEY || undefined,
+  loggerLevel: Lark.LoggerLevel.fatal
+}, handleCardAction);
 
 function safeErrorMessage(error) {
   return error?.response?.data?.msg ||
@@ -102,10 +138,24 @@ function safeErrorMessage(error) {
     '未知错误';
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function forget(promise, label) {
+  promise.catch((error) => console.warn(`${label}失败：${safeErrorMessage(error)}`));
+}
+
 function rememberClaim(claim) {
   if (!claim?.serial) return claim;
   claimCache.set(claim.serial, claim);
   return claim;
+}
+
+function rememberWithdraw(withdraw) {
+  if (!withdraw?.serial) return withdraw;
+  withdrawCache.set(withdraw.serial, withdraw);
+  return withdraw;
 }
 
 function getLarkClient() {
@@ -319,8 +369,19 @@ function cardPlainText(value) {
   return String(value || '').replace(/[<>]/g, '');
 }
 
+function compactMarkdownLines(lines) {
+  return lines.map((line) => cardPlainText(line)).join('\n');
+}
+
 function firstUser(value) {
   return Array.isArray(value) && value.length ? value[0] : null;
+}
+
+function fieldItemId(value) {
+  const item = firstUser(value);
+  if (!item) return '';
+  if (typeof item === 'string') return item;
+  return item.id || item.record_id || item.open_id || '';
 }
 
 async function listRecords(table, fields, limit = 200, offset = 0) {
@@ -444,29 +505,6 @@ async function getTasks() {
   return (meta.get(FIELD.ledgerTask)?.property?.options || []).map((option) => option.name).filter(Boolean);
 }
 
-async function searchUsersByNames(names) {
-  const users = [];
-  const queries = [];
-  for (const name of names) {
-    try {
-      const data = await requestLark({
-        method: 'GET',
-        url: '/open-apis/search/v1/user',
-        params: {
-          query: name,
-          page_size: 20
-        }
-      });
-      users.push(...(data.users || []).map((user) => normalizeUser(user, name)));
-      queries.push({ query: name, has_more: Boolean(data.has_more) });
-    } catch (error) {
-      if (!/status code 400|invalid|bad request/i.test(error?.message || '')) throw error;
-      queries.push({ query: name, has_more: false });
-    }
-  }
-  return { users, queries };
-}
-
 async function getUsersByIds(userIds) {
   const users = [];
   const uniqueIds = Array.from(new Set(userIds.filter(Boolean)));
@@ -482,54 +520,6 @@ async function getUsersByIds(userIds) {
     users.push(...(data.items || []).map((user) => normalizeUser(user)));
   }
   return users;
-}
-
-async function createAccountsFromUsers(users) {
-  if (!users.length) return [];
-  const fieldIds = [FIELD.accountName, FIELD.accountPerson, FIELD.accountStatus];
-  const records = await Promise.all(users.map(async (user) => ({
-    fields: await rowToRecordFields(ACCOUNT_TABLE, fieldIds, [
-      user.localized_name,
-      [{ id: user.open_id }],
-      '启用'
-    ])
-  })));
-  const data = await unwrapLark(getLarkClient().bitable.appTableRecord.batchCreate({
-    path: { app_token: BASE_TOKEN, table_id: ACCOUNT_TABLE },
-    params: { user_id_type: 'open_id' },
-    data: { records }
-  }));
-  return users.map((user, index) => ({
-    id: data.records?.[index]?.record_id,
-    name: user.localized_name,
-    userId: user.open_id,
-    userName: user.localized_name,
-    balance: 0
-  })).filter((account) => account.id);
-}
-
-async function updateAccountsFromUsers(accountUserPairs) {
-  const updatedAccounts = [];
-  for (const { account, user } of accountUserPairs) {
-    await unwrapLark(getLarkClient().bitable.appTableRecord.update({
-      path: { app_token: BASE_TOKEN, table_id: ACCOUNT_TABLE, record_id: account.id },
-      params: { user_id_type: 'open_id' },
-      data: {
-        fields: await fieldsByIdToName(ACCOUNT_TABLE, {
-        [FIELD.accountName]: account.name || user.localized_name,
-        [FIELD.accountPerson]: [{ id: user.open_id }],
-        [FIELD.accountStatus]: '启用'
-        })
-      }
-    }));
-    updatedAccounts.push({
-      ...account,
-      name: account.name || user.localized_name,
-      userId: user.open_id,
-      userName: user.localized_name
-    });
-  }
-  return updatedAccounts;
 }
 
 function normalizeName(value) {
@@ -581,31 +571,6 @@ function matchPeopleToAccounts(people, accounts) {
   });
 }
 
-function matchPeopleToUsers(people, users, queryStates) {
-  const queryStateByName = new Map(
-    queryStates.map((item) => [normalizeName(item.query).toLocaleLowerCase('zh-Hans-CN'), item])
-  );
-  const usersByQuery = new Map();
-  users.forEach((user) => {
-    const query = normalizeName(user.matched_query).toLocaleLowerCase('zh-Hans-CN');
-    if (!usersByQuery.has(query)) usersByQuery.set(query, []);
-    usersByQuery.get(query).push(user);
-  });
-
-  return people.map((name) => {
-    const key = name.toLocaleLowerCase('zh-Hans-CN');
-    const matches = (usersByQuery.get(key) || [])
-      .filter((user) => !user.is_cross_tenant)
-      .filter((user) => normalizeName(user.localized_name) === name);
-    const unique = Array.from(new Map(matches.map((user) => [user.open_id, user])).values());
-    return {
-      name,
-      candidates: unique,
-      hasMore: Boolean(queryStateByName.get(key)?.has_more)
-    };
-  });
-}
-
 function departmentParts(value) {
   return normalizeName(value).split(/[-/／>｜|]/u).map(normalizeName).filter(Boolean);
 }
@@ -613,17 +578,6 @@ function departmentParts(value) {
 function displayDepartment(value) {
   const parts = departmentParts(value);
   return parts[1] || parts[0] || '未显示部门';
-}
-
-function userOption(user) {
-  const departmentPath = user.department || '';
-  return {
-    id: user.open_id,
-    name: user.localized_name,
-    department: displayDepartment(departmentPath),
-    departmentPath,
-    email: user.enterprise_email || user.email || ''
-  };
 }
 
 async function accountOptions(accounts) {
@@ -660,13 +614,10 @@ async function resolveClaimAccounts(people, accounts, selectedUsers = {}) {
   const accountMatches = matchPeopleToAccounts(people, accounts);
   const selectedAccounts = [];
   const missingNames = [];
-  const emptyAccountByName = new Map();
   const selectionRequired = [];
   const selectedUserIds = new Map(
     Object.entries(selectedUsers || {}).map(([name, userId]) => [normalizeName(name), normalizeName(userId)])
   );
-  const usersToCreate = [];
-  const accountUserPairs = [];
 
   for (const match of accountMatches) {
     const pickedUserId = selectedUserIds.get(match.name);
@@ -680,7 +631,6 @@ async function resolveClaimAccounts(people, accounts, selectedUsers = {}) {
         selectedAccounts.push(pickedAccount);
         continue;
       }
-      if (emptyAccounts.length === 1) emptyAccountByName.set(match.name, emptyAccounts[0]);
       missingNames.push(match.name);
       continue;
     }
@@ -704,7 +654,6 @@ async function resolveClaimAccounts(people, accounts, selectedUsers = {}) {
       };
     }
 
-    if (emptyAccounts.length === 1) emptyAccountByName.set(match.name, emptyAccounts[0]);
     missingNames.push(match.name);
   }
 
@@ -713,63 +662,9 @@ async function resolveClaimAccounts(people, accounts, selectedUsers = {}) {
   const lookupNames = Array.from(new Set(missingNames));
   if (!lookupNames.length) return { accounts: selectedAccounts };
 
-  const { users, queries } = await searchUsersByNames(lookupNames);
-  const userMatches = matchPeopleToUsers(lookupNames, users, queries);
-
-  for (const match of userMatches) {
-    if (!missingNames.includes(match.name)) continue;
-    const pickedUserId = selectedUserIds.get(match.name);
-    const user = pickedUserId
-      ? match.candidates.find((candidate) => candidate.open_id === pickedUserId)
-      : match.candidates[0];
-
-    if (!pickedUserId && match.candidates.length > 1) {
-      selectionRequired.push({
-        name: match.name,
-        options: match.candidates.map(userOption)
-      });
-      continue;
-    }
-
-    if (pickedUserId && !user) {
-      selectionRequired.push({
-        name: match.name,
-        options: match.candidates.map(userOption)
-      });
-      continue;
-    }
-
-    if (!user || match.candidates.length === 0) {
-      return { error: `以下人员未匹配到通讯录：${match.name}` };
-    }
-
-    if (!pickedUserId && match.hasMore && match.candidates.length > 1) {
-      selectionRequired.push({
-        name: match.name,
-        options: match.candidates.map(userOption)
-      });
-      continue;
-    }
-
-    const existingAccount = accounts.find((account) => account.userId === user.open_id);
-    if (existingAccount) {
-      selectedAccounts.push(existingAccount);
-      continue;
-    }
-
-    const emptyAccount = emptyAccountByName.get(match.name);
-    if (emptyAccount) {
-      accountUserPairs.push({ account: emptyAccount, user });
-    } else {
-      usersToCreate.push(user);
-    }
-  }
-
-  if (selectionRequired.length) return { selectionRequired };
-
-  const updatedAccounts = await updateAccountsFromUsers(accountUserPairs);
-  const newAccounts = await createAccountsFromUsers(usersToCreate);
-  return { accounts: [...selectedAccounts, ...updatedAccounts, ...newAccounts] };
+  return {
+    error: `以下人员未匹配到账户表中已绑定人员字段的账户：${lookupNames.join('、')}；请先在账户表维护人员字段`
+  };
 }
 
 function accountPersonPayload(account) {
@@ -1048,9 +943,82 @@ function buildInfoCard(title, lines, template = 'green') {
     },
     elements: [{
       tag: 'markdown',
-      content: lines.map((line) => cardPlainText(line)).join('\n')
+      content: compactMarkdownLines(lines)
     }]
   };
+}
+
+function buildWithdrawHelpCard(template = 'blue') {
+  return buildInfoCard('光年币支取助手', [
+    '**支取格式：**支取 姓名 数量',
+    '**示例：**支取 刘云澈 10',
+    '**说明：**机器人会先返回确认卡片，点击确认后才会扣减余额。'
+  ], template);
+}
+
+function buildWithdrawConfirmCard(withdraw) {
+  return {
+    config: {
+      update_multi: true,
+      wide_screen_mode: true
+    },
+    header: {
+      template: 'orange',
+      title: { tag: 'plain_text', content: '确认支取光年币' }
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: compactMarkdownLines([
+          `**支取人：**${withdraw.account.userName || withdraw.account.name}`,
+          `**支取数量：**${withdraw.amount}`,
+          `**当前余额：**${withdraw.beforeBalance}`,
+          `**支取后余额：**${withdraw.afterBalance}`,
+          `**流水号：**${withdraw.serial}`
+        ])
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '确认支取' },
+            type: 'danger',
+            value: {
+              action: 'withdraw_confirm',
+              serial: withdraw.serial,
+              accountId: withdraw.account.id,
+              userId: withdraw.account.userId,
+              amount: withdraw.amount
+            }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '取消' },
+            value: {
+              action: 'withdraw_cancel',
+              serial: withdraw.serial
+            }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function buildWithdrawResultCard(withdraw, status = 'success', message = '') {
+  const ok = status === 'success';
+  const template = ok ? 'green' : status === 'cancelled' ? 'blue' : 'red';
+  const title = ok ? '光年币支取已完成' : status === 'cancelled' ? '支取已取消' : '光年币支取失败';
+  const lines = [
+    `**支取人：**${withdraw?.account?.userName || withdraw?.account?.name || withdraw?.person || '-'}`,
+    `**支取数量：**${withdraw?.amount ? `-${withdraw.amount}` : '-'}`,
+    `**支取前余额：**${withdraw?.beforeBalance ?? '-'}`,
+    `**当前余额：**${withdraw?.afterBalance ?? withdraw?.currentBalance ?? '-'}`,
+    `**流水号：**${withdraw?.serial || '-'}`
+  ];
+  if (message) lines.push(`**说明：**${message}`);
+  return buildInfoCard(title, lines, template);
 }
 
 function claimDisplayName(item) {
@@ -1099,43 +1067,330 @@ async function sendBotMessage(userId, card, idempotencyKey) {
 
 async function sendClaimNotifications(items, submitter = null) {
   if (!items.length) return;
-  const totalAmount = items.reduce((sum, item) => sum + Number(item.amount || 0), 0);
-  const people = uniqueBy(
-    items.map((item) => ({ id: item.userId || item.account?.userId, name: claimDisplayName(item) })),
-    (item) => item.id || item.name
-  ).map((item) => item.name).join('、');
-  const tasks = uniqueBy(items.map((item) => item.task).filter(Boolean), (task) => task).join('、');
-  const serials = items.map((item) => item.serial).filter(Boolean).join('、');
-  const firstSerial = items[0]?.serial || Date.now();
-  const submitterName = submitter?.name || '领取页面用户';
-
-  // 管理员需要知道是谁触发了自动确认，以便审计白名单使用情况。
-  await sendBotMessage(ADMIN_USER_ID, buildInfoCard('光年币领取已自动入账', [
-    `**提交人：**${submitterName}`,
-    `**涉及人员：**${people || '-'}`,
-    `**总数量：**${totalAmount}`,
-    `**任务：**${tasks || '-'}`,
-    `**流水号：**${serials || '-'}`,
-    '**状态：**白名单用户自动确认入账'
-  ]), `gn-admin-${firstSerial}`).catch((error) => console.warn(`管理员通知发送失败：${error.message}`));
-
-  if (submitter?.openId && submitter.openId !== ADMIN_USER_ID) {
-    await sendBotMessage(submitter.openId, buildInfoCard('光年币领取已自动入账', [
-      `**涉及人员：**${people || '-'}`,
-      `**总数量：**${totalAmount}`,
-      `**任务：**${tasks || '-'}`,
-      '**状态：**已入账'
-    ]), `gn-submitter-${firstSerial}`).catch((error) => console.warn(`提交人通知发送失败：${error.message}`));
-  }
+  await sleep(800);
+  const accounts = await getAccounts();
+  const balanceByUser = new Map(accounts.map((account) => [account.userId, account.balance]));
 
   for (const [userId, claims] of groupClaimsByRecipient(items)) {
     const amount = claims.reduce((sum, item) => sum + Number(item.amount || 0), 0);
     const taskText = uniqueBy(claims.map((item) => item.task).filter(Boolean), (task) => task).join('、');
+    const currentBalance = balanceByUser.get(userId);
     await sendBotMessage(userId, buildInfoCard('光年币余额已更新', [
       `**本次入账：**+${amount}`,
+      `**当前余额：**${currentBalance ?? '-'}`,
       `**任务：**${taskText || '-'}`,
       '**状态：**已到账'
     ]), `gn-recipient-${userId}-${claims[0]?.serial || Date.now()}`).catch((error) => console.warn(`入账人通知发送失败：${error.message}`));
+  }
+}
+
+async function getAccountById(accountId) {
+  if (!accountId) return null;
+  return (await getAccounts()).find((account) => account.id === accountId) || null;
+}
+
+async function resolveSingleAccountByName(name) {
+  const accounts = await getAccounts();
+  const resolved = await resolveClaimAccounts([name], accounts);
+  if (resolved.selectionRequired) {
+    const options = resolved.selectionRequired[0]?.options || [];
+    const names = options.map((option) => `${option.name}${option.department ? `（${option.department}）` : ''}`).join('、');
+    const error = new Error(names ? `找到多个「${name}」，请在账户表确认唯一人员后再支取：${names}` : `找到多个「${name}」，请提供更完整姓名`);
+    error.statusCode = 409;
+    throw error;
+  }
+  if (resolved.error) {
+    const error = new Error(resolved.error);
+    error.statusCode = 400;
+    throw error;
+  }
+  const account = resolved.accounts?.[0];
+  if (!account?.id || !account.userId) {
+    const error = new Error(`未找到可支取账户：${name}`);
+    error.statusCode = 404;
+    throw error;
+  }
+  return account;
+}
+
+function createWithdrawDraft(account, amount) {
+  const beforeBalance = Number(account.balance || 0);
+  return rememberWithdraw({
+    serial: `GW-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`,
+    account,
+    amount,
+    beforeBalance,
+    afterBalance: beforeBalance - amount
+  });
+}
+
+async function createWithdrawRecord(withdraw) {
+  const fieldIds = [
+    FIELD.withdrawSerial,
+    FIELD.withdrawPerson,
+    FIELD.withdrawAccount,
+    FIELD.withdrawAmount,
+    FIELD.withdrawBeforeBalance,
+    FIELD.withdrawAfterBalance
+  ];
+  const record = {
+    fields: await rowToRecordFields(WITHDRAW_TABLE, fieldIds, [
+      withdraw.serial,
+      [{ id: withdraw.account.userId }],
+      [{ id: withdraw.account.id }],
+      withdraw.amount,
+      withdraw.beforeBalance,
+      withdraw.afterBalance
+    ])
+  };
+  const data = await unwrapLark(getLarkClient().bitable.appTableRecord.create({
+    path: { app_token: BASE_TOKEN, table_id: WITHDRAW_TABLE },
+    params: { user_id_type: 'open_id' },
+    data: record
+  }));
+  return data.record?.record_id || data.record_id || data.id || '';
+}
+
+async function deleteWithdrawRecord(recordId) {
+  if (!recordId) return;
+  await unwrapLark(getLarkClient().bitable.appTableRecord.delete({
+    path: { app_token: BASE_TOKEN, table_id: WITHDRAW_TABLE, record_id: recordId }
+  }));
+}
+
+async function updateWithdrawRecordSnapshot(recordId, withdraw) {
+  if (!recordId || !withdraw) return;
+  const patch = {
+    [FIELD.withdrawSerial]: withdraw.serial,
+    [FIELD.withdrawBeforeBalance]: withdraw.beforeBalance,
+    [FIELD.withdrawAfterBalance]: withdraw.afterBalance
+  };
+  await unwrapLark(getLarkClient().bitable.appTableRecord.update({
+    path: { app_token: BASE_TOKEN, table_id: WITHDRAW_TABLE, record_id: recordId },
+    params: { user_id_type: 'open_id' },
+    data: {
+      fields: await fieldsByIdToName(WITHDRAW_TABLE, patch)
+    }
+  }));
+}
+
+async function notifyWithdrawRecipient(withdraw, idempotencySuffix = '') {
+  if (!withdraw?.account?.userId) return;
+  await sendBotMessage(withdraw.account.userId, buildInfoCard('光年币余额已更新', [
+    `**本次支取：**-${withdraw.amount}`,
+    `**当前余额：**${withdraw.afterBalance}`,
+    `**流水号：**${withdraw.serial || '-'}`
+  ], 'red'), `gn-withdraw-recipient-${withdraw.account.userId}-${withdraw.serial || idempotencySuffix || Date.now()}`);
+}
+
+async function completeWithdraw(withdraw) {
+  const serial = normalizeName(withdraw?.serial);
+  const idempotency = withdrawCompletionRegistry.start(serial);
+  if (idempotency.status === 'completed') {
+    return {
+      ok: true,
+      withdraw: idempotency.value,
+      card: buildWithdrawResultCard(idempotency.value, 'success', '这笔支取已处理，未重复扣减。')
+    };
+  }
+  if (idempotency.status === 'pending') {
+    return {
+      ok: false,
+      card: buildWithdrawResultCard(withdraw, 'error', '这笔支取正在处理中，请勿重复点击。')
+    };
+  }
+
+  try {
+    const account = await getAccountById(withdraw.account?.id || withdraw.accountId);
+    if (!account?.userId) {
+      withdrawCompletionRegistry.fail(serial);
+      return {
+        ok: false,
+        card: buildWithdrawResultCard(withdraw, 'error', '未找到对应账户，未执行支取。')
+      };
+    }
+    const amount = Number(withdraw.amount);
+    if (!Number.isInteger(amount) || amount <= 0) {
+      withdrawCompletionRegistry.fail(serial);
+      return {
+        ok: false,
+        card: buildWithdrawResultCard({ ...withdraw, account }, 'error', '支取数量无效，未执行支取。')
+      };
+    }
+    const beforeBalance = Number(account.balance || 0);
+    if (beforeBalance < amount) {
+      withdrawCompletionRegistry.fail(serial);
+      return {
+        ok: false,
+        card: buildWithdrawResultCard({
+          ...withdraw,
+          account,
+          amount,
+          beforeBalance,
+          currentBalance: beforeBalance,
+          afterBalance: beforeBalance
+        }, 'error', '余额不足，已拒绝。')
+      };
+    }
+    const committed = rememberWithdraw({
+      ...withdraw,
+      account,
+      amount,
+      beforeBalance,
+      afterBalance: beforeBalance - amount
+    });
+    committed.recordId = await createWithdrawRecord(committed);
+    seenWithdrawRecordDigests.set(committed.recordId, withdrawDigest(committed));
+    await notifyWithdrawRecipient(committed);
+    withdrawCompletionRegistry.finish(serial, committed);
+    return {
+      ok: true,
+      withdraw: committed,
+      card: buildWithdrawResultCard(committed)
+    };
+  } catch (error) {
+    withdrawCompletionRegistry.fail(serial);
+    throw error;
+  }
+}
+
+async function getWithdrawRecord(recordId) {
+  const fieldIds = [
+    FIELD.withdrawSerial,
+    FIELD.withdrawPerson,
+    FIELD.withdrawAccount,
+    FIELD.withdrawAmount,
+    FIELD.withdrawBeforeBalance,
+    FIELD.withdrawAfterBalance,
+    FIELD.withdrawTime
+  ];
+  const fieldNames = await getFieldNames(WITHDRAW_TABLE, fieldIds);
+  const data = await unwrapLark(getLarkClient().bitable.appTableRecord.get({
+    path: { app_token: BASE_TOKEN, table_id: WITHDRAW_TABLE, record_id: recordId },
+    params: {
+      field_names: JSON.stringify(fieldNames),
+      user_id_type: 'open_id'
+    }
+  }));
+  const record = data.record || data;
+  const value = (fieldId) => {
+    const fieldName = fieldNames[fieldIds.indexOf(fieldId)];
+    return record.fields?.[fieldName] ?? record.fields?.[fieldId];
+  };
+  const person = firstUser(value(FIELD.withdrawPerson));
+  const accountId = fieldItemId(value(FIELD.withdrawAccount));
+  const amount = Number(cellText(value(FIELD.withdrawAmount)) || 0);
+  return {
+    id: record.record_id || recordId,
+    serial: cellText(value(FIELD.withdrawSerial)) || `GW-BASE-${recordId}`,
+    person: person?.name || cellText(value(FIELD.withdrawPerson)),
+    userId: person?.id || '',
+    accountId,
+    amount,
+    beforeBalance: Number(cellText(value(FIELD.withdrawBeforeBalance)) || 0),
+    afterBalance: Number(cellText(value(FIELD.withdrawAfterBalance)) || 0),
+    createdAt: cellText(value(FIELD.withdrawTime))
+  };
+}
+
+async function handleManualWithdrawRecord(recordId, options = {}) {
+  const row = await getWithdrawRecord(recordId);
+  if (!row.accountId) {
+    console.warn(`支取记录 ${recordId} 缺少账户关联，跳过通知`);
+    return { ok: false, skipped: true, reason: 'missing_account' };
+  }
+  if (!Number.isInteger(row.amount) || row.amount <= 0) {
+    await deleteWithdrawRecord(recordId);
+    console.warn(`支取记录 ${recordId} 数量无效，已删除`);
+    return { ok: false, rejected: true, reason: 'invalid_amount' };
+  }
+  const account = await getAccountById(row.accountId);
+  await sleep(800);
+  const refreshedAccount = await getAccountById(row.accountId);
+  const effectiveAccount = refreshedAccount || account;
+  if (!effectiveAccount?.userId) {
+    console.warn(`支取记录 ${recordId} 未找到关联账户，跳过通知`);
+    return { ok: false, skipped: true, reason: 'missing_account_record' };
+  }
+  const afterBalance = Number(effectiveAccount.balance || 0);
+  const beforeBalance = Number(row.beforeBalance || afterBalance + row.amount || 0);
+  if (afterBalance < 0) {
+    await deleteWithdrawRecord(recordId);
+    console.warn(`支取记录 ${recordId} 导致余额为负，已删除`);
+    return { ok: false, rejected: true, reason: 'insufficient_balance' };
+  }
+  const withdraw = rememberWithdraw({
+    recordId,
+    serial: row.serial,
+    account: effectiveAccount,
+    amount: row.amount,
+    beforeBalance,
+    afterBalance
+  });
+  await updateWithdrawRecordSnapshot(recordId, withdraw);
+  seenWithdrawRecordDigests.set(recordId, withdrawDigest(withdraw));
+  if (!options.silent) await notifyWithdrawRecipient(withdraw, recordId);
+  return { ok: true, withdraw };
+}
+
+async function listRecentWithdrawRecords(limit = 50) {
+  const fieldIds = [
+    FIELD.withdrawSerial,
+    FIELD.withdrawPerson,
+    FIELD.withdrawAccount,
+    FIELD.withdrawAmount,
+    FIELD.withdrawTime
+  ];
+  const fieldNames = await getFieldNames(WITHDRAW_TABLE, fieldIds);
+  const data = await unwrapLark(getLarkClient().bitable.appTableRecord.list({
+    path: { app_token: BASE_TOKEN, table_id: WITHDRAW_TABLE },
+    params: {
+      field_names: JSON.stringify(fieldNames),
+      page_size: Math.min(500, limit),
+      sort: JSON.stringify([{ field_name: fieldNames[fieldIds.indexOf(FIELD.withdrawTime)], desc: true }]),
+      user_id_type: 'open_id'
+    }
+  }));
+  return (data.items || []).map((record) => {
+    const value = (fieldId) => {
+      const fieldName = fieldNames[fieldIds.indexOf(fieldId)];
+      return record.fields?.[fieldName] ?? record.fields?.[fieldId];
+    };
+    const person = firstUser(value(FIELD.withdrawPerson));
+    const accountId = fieldItemId(value(FIELD.withdrawAccount));
+    return {
+      id: record.record_id,
+      serial: cellText(value(FIELD.withdrawSerial)),
+      person: person?.id || cellText(value(FIELD.withdrawPerson)),
+      accountId,
+      amount: Number(cellText(value(FIELD.withdrawAmount)) || 0)
+    };
+  });
+}
+
+async function pollWithdrawTable() {
+  if (withdrawPollRunning || !WITHDRAW_POLL_ENABLED) return;
+  withdrawPollRunning = true;
+  try {
+    const records = await listRecentWithdrawRecords();
+    for (const record of records) {
+      if (!record.id) continue;
+      const digest = withdrawDigest(record);
+      if (!withdrawPollInitialized) {
+        seenWithdrawRecordDigests.set(record.id, digest);
+        continue;
+      }
+      if (seenWithdrawRecordDigests.get(record.id) === digest) continue;
+      const result = await handleManualWithdrawRecord(record.id);
+      if (result?.ok || result?.rejected || result?.skipped) {
+        seenWithdrawRecordDigests.set(record.id, digest);
+      }
+    }
+    withdrawPollInitialized = true;
+  } catch (error) {
+    console.warn(`支取表轮询失败：${safeErrorMessage(error)}`);
+  } finally {
+    withdrawPollRunning = false;
   }
 }
 
@@ -1239,21 +1494,8 @@ async function getClaimBySerial(serial) {
 }
 
 async function sendApprovalCard(claim) {
-  try {
-    await unwrapLark(getLarkClient().im.message.create({
-      params: {
-        receive_id_type: 'open_id',
-        uuid: `gn-approval-${claim.serial}`
-      },
-      data: {
-        receive_id: ADMIN_USER_ID,
-        msg_type: 'interactive',
-        content: JSON.stringify(buildApprovalCard(claim))
-      }
-    }));
-  } catch (error) {
-    console.error(safeErrorMessage(error));
-  }
+  console.warn(`旧审批卡片发送入口已停用，跳过发送：${claim?.serial || '-'}`);
+  return null;
 }
 
 async function handleApprovalAction(event) {
@@ -1301,6 +1543,148 @@ async function handleApprovalAction(event) {
     console.log(`accepted card action ${action} for ${serial} on ${openMessageId}`);
   }
   return buildApprovalCard({ ...claim, status: nextStatus });
+}
+
+async function handleWithdrawAction(event) {
+  const actionValue = event?.action?.value || event?.event?.action?.value || {};
+  const operatorOpenId = event?.open_id || event?.operator?.open_id || event?.event?.operator?.open_id || event?.user_id || '';
+  const action = actionValue.action;
+  const serial = normalizeName(actionValue.serial);
+
+  if (operatorOpenId !== ADMIN_USER_ID) {
+    return buildInfoCard('无权操作支取', [
+      '**状态：**已拒绝',
+      '**说明：**只有当前管理员可以发起或确认支取。'
+    ], 'red');
+  }
+
+  const cached = withdrawCache.get(serial);
+  if (action === 'withdraw_cancel') {
+    return buildWithdrawResultCard(cached || { serial }, 'cancelled', '管理员已取消，未执行支取。');
+  }
+  if (action !== 'withdraw_confirm' || !serial) {
+    return buildInfoCard('无法识别支取操作', [
+      '**状态：**已拒绝',
+      '**说明：**请重新发送支取命令。'
+    ], 'red');
+  }
+
+  const withdraw = cached || {
+    serial,
+    accountId: normalizeName(actionValue.accountId),
+    userId: normalizeName(actionValue.userId),
+    amount: Number(actionValue.amount)
+  };
+  const result = await completeWithdraw(withdraw);
+  return result.card;
+}
+
+async function handleCardAction(event) {
+  const actionValue = event?.action?.value || event?.event?.action?.value || {};
+  if (String(actionValue.action || '').startsWith('withdraw_')) {
+    return handleWithdrawAction(event);
+  }
+  return buildInfoCard('旧审批卡片入口已停用', [
+    '**状态：**已拒绝',
+    '**说明：**请通过白名单领取页面提交，旧审批卡片不能继续修改状态。'
+  ], 'red');
+}
+
+function normalizeEventPayload(payload) {
+  const event = payload?.event || payload || {};
+  const senderId =
+    event.sender?.sender_id?.open_id ||
+    event.sender?.sender_id?.user_id ||
+    event.sender_id?.open_id ||
+    event.sender_id ||
+    event.open_id ||
+    '';
+  const message = event.message || event;
+  const messageId = message.message_id || event.message_id || event.id || payload?.header?.event_id || '';
+  const chatType = message.chat_type || event.chat_type || '';
+  const chatId = message.chat_id || event.chat_id || '';
+  const messageType = message.message_type || event.message_type || '';
+  let content = message.content ?? event.content ?? '';
+  if (typeof content === 'string') {
+    try {
+      const parsed = JSON.parse(content);
+      content = parsed.text || parsed.content || content;
+    } catch {
+      // keep plain text
+    }
+  }
+  return {
+    eventId: payload?.header?.event_id || event.event_id || messageId,
+    senderId,
+    chatType,
+    chatId,
+    messageId,
+    messageType,
+    content: typeof content === 'string' ? content : JSON.stringify(content)
+  };
+}
+
+function rememberEvent(eventId) {
+  if (!eventId) return true;
+  const now = Date.now();
+  for (const [id, time] of processedEventIds.entries()) {
+    if (now - time > 10 * 60 * 1000) processedEventIds.delete(id);
+  }
+  if (processedEventIds.has(eventId)) return false;
+  processedEventIds.set(eventId, now);
+  return true;
+}
+
+async function handleMessageEvent(event) {
+  const normalized = normalizeEventPayload(event);
+  if (!rememberEvent(normalized.eventId)) return;
+  if (normalized.chatType && normalized.chatType !== 'p2p') return;
+  if (normalized.messageType && normalized.messageType !== 'text') return;
+
+  const command = parseWithdrawCommand(normalized.content);
+  if (!command) return;
+
+  if (normalized.senderId !== ADMIN_USER_ID) {
+    await sendBotMessage(normalized.senderId, buildInfoCard('无权发起支取', [
+      '**状态：**已拒绝',
+      '**说明：**目前只有管理员可以发起光年币支取。'
+    ], 'red'), `gn-withdraw-denied-${normalized.eventId || Date.now()}`).catch((error) => console.warn(`支取拒绝通知发送失败：${error.message}`));
+    return;
+  }
+
+  if (command.help) {
+    await sendBotMessage(ADMIN_USER_ID, buildWithdrawHelpCard(), `gn-withdraw-help-${normalized.eventId || Date.now()}`);
+    return;
+  }
+  if (command.error) {
+    await sendBotMessage(ADMIN_USER_ID, buildInfoCard('支取命令格式不正确', [
+      `**说明：**${command.error}`,
+      '**示例：**支取 刘云澈 10'
+    ], 'red'), `gn-withdraw-format-${normalized.eventId || Date.now()}`);
+    return;
+  }
+
+  try {
+    const account = await resolveSingleAccountByName(command.name);
+    if (account.balance < command.amount) {
+      await sendBotMessage(ADMIN_USER_ID, buildWithdrawResultCard({
+        account,
+        amount: command.amount,
+        beforeBalance: account.balance,
+        currentBalance: account.balance,
+        afterBalance: account.balance,
+        serial: `GW-REJECT-${Date.now()}`
+      }, 'error', '余额不足，已拒绝。'), `gn-withdraw-insufficient-${normalized.eventId || Date.now()}`);
+      return;
+    }
+    const draft = createWithdrawDraft(account, command.amount);
+    await sendBotMessage(ADMIN_USER_ID, buildWithdrawConfirmCard(draft), `gn-withdraw-confirm-${draft.serial}`);
+  } catch (error) {
+    await sendBotMessage(ADMIN_USER_ID, buildInfoCard('支取发起失败', [
+      `**说明：**${safeErrorMessage(error)}`,
+      '**示例：**支取 刘云澈 10'
+    ], 'red'), `gn-withdraw-error-${normalized.eventId || Date.now()}`).catch((sendError) => console.warn(`支取错误通知发送失败：${sendError.message}`));
+  }
 }
 
 process.on('unhandledRejection', (error) => {
@@ -1387,15 +1771,74 @@ async function handleOAuthCallback(req, res, url) {
 
 async function handleCardActionCallback(req, res) {
   const payload = await readJson(req);
+  if (!isEncryptedCallbackPayload(payload)) {
+    assertCallbackVerificationToken(payload, LARK_VERIFICATION_TOKEN);
+  } else if (!LARK_ENCRYPT_KEY) {
+    return sendJson(req, res, 400, { error: '卡片回调已加密，但服务未配置 LARK_ENCRYPT_KEY' });
+  }
   if (payload?.challenge) {
     return sendJson(req, res, 200, { challenge: payload.challenge });
   }
+  const assigned = Object.assign(Object.create({ headers: req.headers }), payload);
+  const card = await cardActionHandler.invoke(assigned);
+  if (!card) return sendJson(req, res, 401, { error: '卡片回调校验失败' });
+  return sendJson(req, res, 200, card);
+}
 
-  // 新版本采用“白名单用户自动入账”，不再通过飞书卡片按钮审批。
-  // 继续保留 challenge 是为了飞书后台 URL 校验；真实卡片动作一律拒绝，避免旧卡片成为状态修改入口。
-  return sendJson(req, res, 410, {
-    error: '旧审批卡片入口已停用，请通过白名单领取页面提交。'
+async function handleLarkEventCallback(req, res) {
+  const payload = await readJson(req);
+  if (isEncryptedCallbackPayload(payload)) {
+    return sendJson(req, res, 400, { error: '消息事件暂不支持加密回调，请在开放平台关闭事件加密' });
+  }
+  assertCallbackVerificationToken(payload, LARK_VERIFICATION_TOKEN);
+  if (payload?.challenge) {
+    return sendJson(req, res, 200, { challenge: payload.challenge });
+  }
+  const type = payload?.header?.event_type || payload?.event?.type || payload?.type;
+  if (type === 'url_verification') {
+    return sendJson(req, res, 200, { challenge: payload.challenge });
+  }
+  if (type === 'im.message.receive_v1' || payload?.event?.message || payload?.message_type) {
+    forget(handleMessageEvent(payload), '处理飞书消息事件');
+  }
+  return sendJson(req, res, 200, { ok: true });
+}
+
+function startLarkEventWsClient() {
+  if (!LARK_WS_EVENTS_ENABLED) return;
+  if (!LARK_APP_SECRET) {
+    console.warn('未启动飞书长连接事件：缺少 FEISHU_APP_SECRET');
+    return;
+  }
+  if (larkWsClient) return;
+
+  larkWsClient = new Lark.WSClient({
+    appId: LARK_APP_ID,
+    appSecret: LARK_APP_SECRET,
+    domain: Lark.Domain.Feishu,
+    loggerLevel: Lark.LoggerLevel.fatal,
+    onReady: () => console.log('飞书长连接事件已连接'),
+    onError: (error) => console.warn(`飞书长连接事件错误：${safeErrorMessage(error)}`)
   });
+  const eventDispatcher = new Lark.EventDispatcher({
+    loggerLevel: Lark.LoggerLevel.fatal
+  }).register({
+    'im.message.receive_v1': async (data) => {
+      forget(handleMessageEvent({ event: data, header: { event_id: data?.event_id } }), '处理飞书长连接消息事件');
+    }
+  });
+  larkWsClient.start({ eventDispatcher });
+}
+
+async function handleWithdrawTableEvent(req, res) {
+  const payload = await readJson(req);
+  if (WITHDRAW_WEBHOOK_TOKEN && payload.token !== WITHDRAW_WEBHOOK_TOKEN) {
+    return sendJson(req, res, 403, { error: '无权调用支取表回调' });
+  }
+  const recordId = normalizeName(payload.record_id || payload.recordId || payload.id);
+  if (!recordId) return sendJson(req, res, 400, { error: '缺少支取表 record_id' });
+  const result = await handleManualWithdrawRecord(recordId);
+  return sendJson(req, res, result.ok ? 200 : 400, result);
 }
 
 function imageBufferFromDataUrl(image) {
@@ -1672,7 +2115,7 @@ async function handleApi(req, res, pathname) {
       }
 
       const result = await createAutoConfirmedClaims(claimItems, '图片批量上传；白名单用户自动确认入账');
-      sendClaimNotifications(claimItems, session);
+      forget(sendClaimNotifications(claimItems, session), '发送入账通知');
       return sendJson(req, res, 200, {
         ok: true,
         serial: claimItems[0]?.serial,
@@ -1725,7 +2168,7 @@ async function handleApi(req, res, pathname) {
       serial: `GN-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
     }));
     const result = await createAutoConfirmedClaims(claimItems, '白名单用户自动确认入账');
-    sendClaimNotifications(claimItems, session);
+    forget(sendClaimNotifications(claimItems, session), '发送入账通知');
     return sendJson(req, res, 200, {
       ok: true,
       serial: claimItems[0]?.serial,
@@ -1768,6 +2211,10 @@ createServer(async (req, res) => {
       await handleOAuthCallback(req, res, url);
     } else if (req.method === 'POST' && url.pathname === '/lark/card-action') {
       await handleCardActionCallback(req, res);
+    } else if (req.method === 'POST' && url.pathname === '/lark/events') {
+      await handleLarkEventCallback(req, res);
+    } else if (req.method === 'POST' && url.pathname === '/lark/withdraw-table-event') {
+      await handleWithdrawTableEvent(req, res);
     } else if (url.pathname.startsWith('/api/')) {
       await handleApi(req, res, url.pathname);
     } else if (url.pathname === '/review') {
@@ -1781,4 +2228,9 @@ createServer(async (req, res) => {
   }
 }).listen(port, () => {
   console.log(`光年币领取系统已启动：http://localhost:${port}`);
+  if (WITHDRAW_POLL_ENABLED) {
+    setTimeout(() => pollWithdrawTable(), 1000);
+    setInterval(() => pollWithdrawTable(), WITHDRAW_POLL_INTERVAL_MS).unref();
+  }
+  startLarkEventWsClient();
 });
