@@ -77,10 +77,11 @@ PORT=19001
 
 - `PUBLIC_ORIGIN` 必须是用户实际访问的 HTTPS 地址。
 - 飞书开发者后台的 OAuth 重定向 URL 必须配置为：`PUBLIC_ORIGIN/oauth/callback`。
-- 飞书开放平台事件订阅 URL：`PUBLIC_ORIGIN/lark/events`，订阅 `im.message.receive_v1`。
+- 飞书开放平台事件订阅方式默认使用长连接，订阅 `im.message.receive_v1`；如果改为 HTTP 事件订阅，URL 为 `PUBLIC_ORIGIN/lark/events`。
 - 飞书开放平台卡片回调 URL：`PUBLIC_ORIGIN/lark/card-action`。
 - 卡片回调可启用验签/加密，并把后台的 Verification Token / Encrypt Key 写入 `LARK_VERIFICATION_TOKEN` / `LARK_ENCRYPT_KEY`。
 - 消息事件 `/lark/events` 当前不要开启事件加密；如需开启，需要先补事件解密适配。
+- `LARK_WS_EVENTS_ENABLED=true` 时服务会启动飞书长连接事件客户端；同一应用多实例部署时，同一条事件只会随机推给其中一个实例。
 - `SESSION_SECRET` 用于签名 Cookie，不能使用示例值。
 - `ADMIN_USER_ID` 当前为芮婷在“光年币助手”应用视角下的 open_id，只有该 open_id 能发起和确认支取。
 - `WHITELIST_TABLE` 为空或字段 ID 错误时，所有业务接口都会无法通过白名单校验。
@@ -111,7 +112,7 @@ PORT=19001
 - App ID：`cli_aaba740b6939dbb7`。
 - 应用头像：使用用户提供的蓝色卡通洋葱货币图案。
 - OAuth 重定向 URL：`https://guangnianbi.yc345.tv/oauth/callback`。
-- 事件订阅 URL：`https://guangnianbi.yc345.tv/lark/events`，订阅 `im.message.receive_v1`，不要开启事件加密。
+- 事件订阅：使用长连接接收事件，订阅 `im.message.receive_v1`；如切 HTTP，URL 为 `https://guangnianbi.yc345.tv/lark/events`，不要开启事件加密。
 - 卡片回调 URL：`https://guangnianbi.yc345.tv/lark/card-action`。
 - 应用可见范围至少覆盖：芮婷、前端授权名单用户、账户表所有可能被入账/支取人员。
 - 把应用加入目标多维表格协作者，并给编辑权限。

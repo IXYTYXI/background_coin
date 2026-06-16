@@ -66,6 +66,7 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const WITHDRAW_POLL_INTERVAL_MS = Number(process.env.WITHDRAW_POLL_INTERVAL_MS || 60 * 1000);
 const WITHDRAW_POLL_ENABLED = process.env.WITHDRAW_POLL_ENABLED !== 'false';
+const LARK_WS_EVENTS_ENABLED = process.env.LARK_WS_EVENTS_ENABLED !== 'false';
 const WITHDRAW_WEBHOOK_TOKEN = process.env.WITHDRAW_WEBHOOK_TOKEN || SESSION_SECRET || '';
 const rateLimitBuckets = new Map();
 const FEISHU_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
@@ -119,6 +120,7 @@ let withdrawPollInitialized = false;
 let withdrawPollRunning = false;
 let whitelistCache = null;
 let larkClient;
+let larkWsClient;
 let ocrWorkerPromise;
 
 const cardActionHandler = new Lark.CardActionHandler({
@@ -1802,6 +1804,32 @@ async function handleLarkEventCallback(req, res) {
   return sendJson(req, res, 200, { ok: true });
 }
 
+function startLarkEventWsClient() {
+  if (!LARK_WS_EVENTS_ENABLED) return;
+  if (!LARK_APP_SECRET) {
+    console.warn('未启动飞书长连接事件：缺少 FEISHU_APP_SECRET');
+    return;
+  }
+  if (larkWsClient) return;
+
+  larkWsClient = new Lark.WSClient({
+    appId: LARK_APP_ID,
+    appSecret: LARK_APP_SECRET,
+    domain: Lark.Domain.Feishu,
+    loggerLevel: Lark.LoggerLevel.fatal,
+    onReady: () => console.log('飞书长连接事件已连接'),
+    onError: (error) => console.warn(`飞书长连接事件错误：${safeErrorMessage(error)}`)
+  });
+  const eventDispatcher = new Lark.EventDispatcher({
+    loggerLevel: Lark.LoggerLevel.fatal
+  }).register({
+    'im.message.receive_v1': async (data) => {
+      forget(handleMessageEvent({ event: data, header: { event_id: data?.event_id } }), '处理飞书长连接消息事件');
+    }
+  });
+  larkWsClient.start({ eventDispatcher });
+}
+
 async function handleWithdrawTableEvent(req, res) {
   const payload = await readJson(req);
   if (WITHDRAW_WEBHOOK_TOKEN && payload.token !== WITHDRAW_WEBHOOK_TOKEN) {
@@ -2204,4 +2232,5 @@ createServer(async (req, res) => {
     setTimeout(() => pollWithdrawTable(), 1000);
     setInterval(() => pollWithdrawTable(), WITHDRAW_POLL_INTERVAL_MS).unref();
   }
+  startLarkEventWsClient();
 });
